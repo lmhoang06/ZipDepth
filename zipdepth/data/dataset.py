@@ -3,7 +3,14 @@
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-from turbojpeg import TurboJPEG, TJPF_RGB
+try:
+    from turbojpeg import TurboJPEG, TJPF_RGB
+    _TURBO_JPEG = TurboJPEG()
+except Exception:
+    TurboJPEG = None
+    TJPF_RGB = None
+    _TURBO_JPEG = None
+
 from pathlib import Path
 from typing import Optional, List
 import cv2
@@ -30,7 +37,7 @@ class LargeScaleDepthDataset(Dataset):
                  max_samples: Optional[int] = None):
 
         self.transform = transform
-        self._jpeg = TurboJPEG()
+        self._jpeg = _TURBO_JPEG
 
         index_path = Path(index_file)
         prefix = str(index_path.with_suffix(''))
@@ -160,7 +167,7 @@ class LargeScaleDepthDataset(Dataset):
         }
 
     def _load_rgb(self, path: str) -> np.ndarray:
-        if path.lower().endswith(('.jpg', '.jpeg')):
+        if self._jpeg is not None and path.lower().endswith(('.jpg', '.jpeg')):
             with open(path, 'rb') as f:
                 return self._jpeg.decode(f.read(), pixel_format=TJPF_RGB)
         else:

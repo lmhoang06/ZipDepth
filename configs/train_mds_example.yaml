@@ -1,0 +1,37 @@
+# Example Configuration for Training ZipDepth with MosaicML Streaming Shards
+# Supports scattered multi-dataset directories (e.g. independently mounted Kaggle datasets)
+
+model:
+  variant: "small"        # small, base, large, giant
+  upsample_unfold: true
+
+loss:
+  alpha_ssi: 1.0          # scale-and-shift invariant depth loss weight
+  alpha_grad: 2.0         # spatial gradient loss weight
+
+data:
+  format: "mds"           # "mds" for MosaicML Streaming, "classic" for .npy index
+  height: 384             # Stage 2: 384x384 (or 512 for Stage 3)
+  width: 384
+  
+  # Option A: Direct list or comma-separated directory paths (equal weighting)
+  # mds_dirs: "/kaggle/input/zipdepth-ade20k,/kaggle/input/zipdepth-hrwsi"
+
+  # Option B: Streams configuration path or inline stream definitions (weighted domain proportions)
+  streams_config: "configs/streams_multidomain_example.yaml"
+  
+  # Optional: local cache limit when streaming from remote bucket / HuggingFace (e.g. "5gb")
+  # cache_limit: "5gb"
+
+training:
+  epochs: 20
+  batch_size: 16
+  num_workers: 4
+  lr: 5.0e-4
+  weight_decay: 0.01
+  save_dir: "./checkpoints/{variant}_{height}x{width}_e{epochs}_b{batch_size}"
+  save_every_steps: 1000
+
+amp:
+  enabled: true
+  dtype: "bfloat16"       # bfloat16 or float16

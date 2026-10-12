@@ -65,7 +65,11 @@ def merge_config_args(cfg: dict, args: argparse.Namespace) -> argparse.Namespace
 
         'height':              cfg.get('data', {}).get('height', 512),
         'width':               cfg.get('data', {}).get('width', 512),
+        'data_format':         cfg.get('data', {}).get('format', 'auto'),
         'index_file':          cfg.get('data', {}).get('index_file', 'data/indexes/dataset_index.json'),
+        'mds_dirs':            cfg.get('data', {}).get('mds_dirs', None),
+        'streams_config':      cfg.get('data', {}).get('streams_config', None),
+        'cache_limit':         cfg.get('data', {}).get('cache_limit', None),
         'domains':             cfg.get('data', {}).get('domains', None),
         'max_train_samples':   cfg.get('data', {}).get('max_samples', None),
         'balanced_sampling':   cfg.get('data', {}).get('balanced_sampling', False),
@@ -157,41 +161,65 @@ def main(args):
     print_main("\nLoading training dataset...", rank)
     train_transforms = get_train_transforms(height=args.height, width=args.width)
 
-    train_dataset = LargeScaleDepthDataset(
-        index_file=args.index_file,
-        domains=args.domains.split(',') if isinstance(args.domains, str) else args.domains,
-        transform=train_transforms,
-        max_samples=args.max_train_samples,
+    use_mds = (args.data_format == 'mds') or (
+        args.data_format == 'auto' and (args.mds_dirs is not None or args.streams_config is not None)
     )
 
-    if args.balanced_sampling:
-        train_sampler = BalancedDomainSampler(
-            dataset=train_dataset,
-            num_samples=len(train_dataset),
-            temperature=args.balance_temperature,
-            rank=rank,
-            world_size=world_size,
+    if use_mds:
+        from zipdepth.data import create_mds_dataloader
+        sources = args.streams_config if args.streams_config is not None else args.mds_dirs
+        print_main(f"Using MosaicML Streaming data sources: {sources}", rank)
+        train_loader, train_dataset = create_mds_dataloader(
+            sources=sources,
+            height=args.height,
+            width=args.width,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            shuffle=True,
+            cache_limit=args.cache_limit,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=(args.num_workers > 0),
+            prefetch_factor=1 if args.num_workers > 0 else None,
+            transform=train_transforms,
         )
-    elif is_distributed:
-        train_sampler = WorkerDistributedSampler(
-            train_dataset, num_replicas=world_size, rank=rank,
-            shuffle=True, drop_last=True,
-        )
-    else:
         train_sampler = None
+    else:
+        train_dataset = LargeScaleDepthDataset(
+            index_file=args.index_file,
+            domains=args.domains.split(',') if isinstance(args.domains, str) else args.domains,
+            transform=train_transforms,
+            max_samples=args.max_train_samples,
+        )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=1 if args.num_workers > 0 else None,
-        worker_init_fn=worker_init_fn if args.num_workers > 0 else None,
-    )
+        if args.balanced_sampling:
+            train_sampler = BalancedDomainSampler(
+                dataset=train_dataset,
+                num_samples=len(train_dataset),
+                temperature=args.balance_temperature,
+                rank=rank,
+                world_size=world_size,
+            )
+        elif is_distributed:
+            train_sampler = WorkerDistributedSampler(
+                train_dataset, num_replicas=world_size, rank=rank,
+                shuffle=True, drop_last=True,
+            )
+        else:
+            train_sampler = None
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=(args.num_workers > 0),
+            prefetch_factor=1 if args.num_workers > 0 else None,
+            worker_init_fn=worker_init_fn if args.num_workers > 0 else None,
+        )
 
     # ========================================================================
     # OPTIMIZER & SCHEDULER
@@ -422,8 +450,17 @@ if __name__ == '__main__':
     parser.add_argument('--model-variant', type=str, default=None,
                         choices=['small', 'base', 'large', 'giant'])
 
-    # Data (required)
+    # Data
+    parser.add_argument('--data-format', type=str, default=None,
+                        choices=['classic', 'mds', 'auto'],
+                        help='Data loader format: "classic" (.npy index) or "mds" (MosaicML Streaming)')
     parser.add_argument('--index-file', type=str, default=None)
+    parser.add_argument('--mds-dirs', type=str, default=None,
+                        help='Comma-separated paths or glob pattern to MDS shard directories (e.g. "/kaggle/input/ds1,/kaggle/input/ds2")')
+    parser.add_argument('--streams-config', type=str, default=None,
+                        help='Path to YAML or JSON streams configuration file for multi-dataset balancing')
+    parser.add_argument('--cache-limit', type=str, default=None,
+                        help='Local disk cache limit for streaming from remote buckets (e.g. "5gb")')
     parser.add_argument('--domains', type=str, default=None,
                         help='Comma-separated domain filter (e.g. "kitti,nyu")')
     parser.add_argument('--max-train-samples', type=int, default=None)

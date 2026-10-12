@@ -1,0 +1,19 @@
+# Multi-Domain Streams Configuration for ZipDepth
+# Interleaves multiple scattered dataset sources with custom proportional weighting.
+
+streams:
+  # Indoor / Scene Domain
+  - local: "/kaggle/input/zipdepth-shards-ade20k"
+    proportion: 0.25
+
+  # High-Resolution Outdoor / Web Domain
+  - local: "/kaggle/input/zipdepth-shards-hrwsi"
+    proportion: 0.25
+
+  # General Object / Context Domain
+  - local: "/kaggle/input/zipdepth-shards-coco"
+    proportion: 0.25
+
+  # Autonomous Driving / Street Domain
+  - local: "/kaggle/input/zipdepth-shards-bdd100k"
+    proportion: 0.25
