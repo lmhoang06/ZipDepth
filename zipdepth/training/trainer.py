@@ -8,7 +8,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 try:
     import wandb
@@ -151,6 +151,8 @@ class ZipDepthTrainer:
             desc='Training',
             disable=disable_tqdm,
             initial=0,
+            mininterval=0.5,
+            dynamic_ncols=True,
             bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
         )
 

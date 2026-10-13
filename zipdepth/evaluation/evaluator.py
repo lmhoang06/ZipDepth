@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from zipdepth.evaluation.metrics import (
     METRIC_FUNCTIONS,

@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 import time
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from dataclasses import dataclass
 from typing import Tuple, Optional
 

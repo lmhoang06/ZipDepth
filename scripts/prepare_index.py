@@ -63,7 +63,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 
 RGB_EXTENSIONS  = {'.jpg', '.jpeg', '.JPG', '.JPEG', '.png', '.webp'}
