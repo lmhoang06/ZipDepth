@@ -24,6 +24,96 @@ except ImportError:
     _ShardState = None
     STREAMING_AVAILABLE = False
 
+
+def _patch_streaming_hf_downloader():
+    """Patches MosaicML's HFDownloader to stream directly from Hugging Face CloudFront CDN.
+
+    Bypasses HF's /api/datasets/.../xet-read-token REST API (1,000 req / 5 min limit) and
+    explicitly attaches the user's HF_TOKEN for authenticated quota (up to 5,000 req / 5 min).
+    """
+    try:
+        from streaming.base.storage.download import HFDownloader
+        import requests
+        import random
+        import time
+
+        def _direct_cdn_download(self, remote, local, timeout):
+            parts = remote.split('/')
+            if len(parts) >= 6 and parts[0] == 'hf:' and parts[2] == 'datasets':
+                repo_org = parts[3]
+                repo_name = parts[4]
+                subpath = '/'.join(parts[5:])
+                cdn_url = f"https://huggingface.co/datasets/{repo_org}/{repo_name}/resolve/main/{subpath}"
+            else:
+                from huggingface_hub import hf_hub_download
+                _, _, _, repo_org, repo_name, path = remote.split('/', 5)
+                local_dirname = os.path.dirname(local)
+                hf_hub_download(repo_id=f'{repo_org}/{repo_name}',
+                                filename=path,
+                                repo_type='dataset',
+                                local_dir=local_dirname)
+                downloaded_name = os.path.join(local_dirname, path)
+                os.rename(downloaded_name, local)
+                return
+
+            local_dirname = os.path.dirname(local)
+            os.makedirs(local_dirname, exist_ok=True)
+
+            if os.path.isfile(local) and os.path.getsize(local) > 0:
+                return
+
+            token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            if not token:
+                try:
+                    from kaggle_secrets import UserSecretsClient
+                    token = UserSecretsClient().get_secret("HF_TOKEN")
+                except Exception:
+                    pass
+
+            headers = {"User-Agent": "ZipDepth-MosaicML-Streaming/1.0"}
+            if token and token.strip():
+                headers["Authorization"] = f"Bearer {token.strip()}"
+
+            tmp_file = f"{local}.tmp.{os.getpid()}"
+            max_retries = 5
+            req_timeout = timeout if timeout and timeout > 0 else 180
+
+            for attempt in range(max_retries):
+                try:
+                    with requests.get(cdn_url, headers=headers, stream=True, timeout=(15, req_timeout)) as resp:
+                        if resp.status_code == 429:
+                            retry_after = resp.headers.get("Retry-After")
+                            wait_time = float(retry_after) if retry_after else (2 ** attempt * 2 + random.uniform(1.0, 2.5))
+                            time.sleep(wait_time)
+                            continue
+
+                        resp.raise_for_status()
+
+                        with open(tmp_file, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+
+                        os.replace(tmp_file, local)
+                        return
+                except Exception as e:
+                    if os.path.exists(tmp_file):
+                        try:
+                            os.remove(tmp_file)
+                        except Exception:
+                            pass
+                    if attempt == max_retries - 1:
+                        raise e
+                    time.sleep(2 ** attempt * 1.5 + random.uniform(0.5, 1.5))
+
+        HFDownloader._download_file_impl = _direct_cdn_download
+    except Exception:
+        pass
+
+
+if STREAMING_AVAILABLE:
+    _patch_streaming_hf_downloader()
+
 try:
     from turbojpeg import TurboJPEG, TJPF_RGB
     _TURBO_JPEG = TurboJPEG()
@@ -370,6 +460,9 @@ def create_mds_dataloader(
     if has_remote and cache_limit is None:
         cache_limit = "15gb"
         print("[Info] Remote cloud streams detected without cache_limit. Setting default cache_limit='15gb' to protect local disk.")
+
+    if has_remote and "predownload" not in kwargs:
+        kwargs["predownload"] = max(batch_size, 32)
 
     dataset = MDSLargeScaleDepthDataset(
         streams=streams,
