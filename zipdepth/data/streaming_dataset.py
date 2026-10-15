@@ -231,13 +231,39 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
 
         # In hybrid setups (local mounted + cloud streaming), subtract read-only local mounts
         # (/kaggle/input) from cache_usage so cache_limit strictly bounds the remote downloads.
-        if getattr(self, 'cache_limit', None):
+        if getattr(self, 'cache_limit', None) and getattr(getattr(self, '_unique_rank_world', None), 'is_local_leader', True):
             readonly_bytes = 0
-            for shard in getattr(self, 'shards', []):
-                if getattr(shard.stream, 'remote', None) is None or '/kaggle/input' in str(getattr(shard.stream, 'local', '')):
-                    readonly_bytes += getattr(shard, 'raw_size', 0)
+            for shard_id, shard in enumerate(getattr(self, 'shards', [])):
+                if self._is_readonly_shard(shard_id):
+                    size_fn = getattr(shard, 'get_raw_size', None)
+                    readonly_bytes += size_fn() if callable(size_fn) else getattr(shard, 'raw_size', 0)
+            for stream in getattr(self, 'streams', []):
+                if getattr(stream, 'remote', None) is None or '/kaggle/input' in str(getattr(stream, 'local', '')):
+                    index_fn = getattr(stream, 'get_index_size', None)
+                    if callable(index_fn):
+                        readonly_bytes += index_fn()
             if readonly_bytes > 0:
                 self.cache_usage = max(0, self.cache_usage - readonly_bytes)
+
+    def _is_readonly_shard(self, shard_id):
+        """Returns True if the shard is on a read-only filesystem or local mount (not downloaded)."""
+        if hasattr(self, 'stream_per_shard') and hasattr(self, 'streams'):
+            try:
+                stream_id = self.stream_per_shard[shard_id]
+                stream = self.streams[stream_id]
+                if getattr(stream, 'remote', None) is None or '/kaggle/input' in str(getattr(stream, 'local', '')):
+                    return True
+            except Exception:
+                pass
+
+        if hasattr(self, 'shards') and shard_id < len(self.shards):
+            shard = self.shards[shard_id]
+            dirname = str(getattr(shard, 'dirname', ''))
+            raw_fn = str(getattr(shard, 'raw_filename', ''))
+            if '/kaggle/input' in dirname or '/kaggle/input' in raw_fn:
+                return True
+
+        return False
 
     def _evict_coldest_shard(self):
         """Evicts the coldest shard ONLY from downloadable remote streams.
@@ -248,10 +274,10 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
         states = self._shard_states.numpy()
         access_times = self._shard_access_times.numpy()
 
+        local_shard_ids = np.where(states == _ShardState.LOCAL)[0]
         evictable_shard_ids = [
-            i for i in np.where(states == _ShardState.LOCAL)[0]
-            if getattr(self.shards[i].stream, 'remote', None) is not None
-            and '/kaggle/input' not in str(getattr(self.shards[i].stream, 'local', ''))
+            i for i in local_shard_ids
+            if not self._is_readonly_shard(i)
         ]
 
         if not evictable_shard_ids:
@@ -264,8 +290,7 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
 
     def _evict_shard(self, shard_id):
         """Safely evict a remote shard while preventing deletion of read-only local mounts."""
-        shard = self.shards[shard_id]
-        if getattr(shard.stream, 'remote', None) is None or '/kaggle/input' in str(getattr(shard.stream, 'local', '')):
+        if self._is_readonly_shard(shard_id):
             return
 
         super()._evict_shard(shard_id)
