@@ -16,10 +16,12 @@ from torch.utils.data import DataLoader
 
 try:
     from streaming import StreamingDataset, Stream
+    from streaming.base.dataset import _ShardState
     STREAMING_AVAILABLE = True
 except ImportError:
     StreamingDataset = object
     Stream = None
+    _ShardState = None
     STREAMING_AVAILABLE = False
 
 try:
@@ -227,6 +229,47 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
             **kwargs
         )
 
+        # In hybrid setups (local mounted + cloud streaming), subtract read-only local mounts
+        # (/kaggle/input) from cache_usage so cache_limit strictly bounds the remote downloads.
+        if getattr(self, 'cache_limit', None):
+            readonly_bytes = 0
+            for shard in getattr(self, 'shards', []):
+                if getattr(shard.stream, 'remote', None) is None or '/kaggle/input' in str(getattr(shard.stream, 'local', '')):
+                    readonly_bytes += getattr(shard, 'raw_size', 0)
+            if readonly_bytes > 0:
+                self.cache_usage = max(0, self.cache_usage - readonly_bytes)
+
+    def _evict_coldest_shard(self):
+        """Evicts the coldest shard ONLY from downloadable remote streams.
+        Local read-only mounts (e.g. /kaggle/input) are strictly protected."""
+        if _ShardState is None:
+            return
+
+        states = self._shard_states.numpy()
+        access_times = self._shard_access_times.numpy()
+
+        evictable_shard_ids = [
+            i for i in np.where(states == _ShardState.LOCAL)[0]
+            if getattr(self.shards[i].stream, 'remote', None) is not None
+            and '/kaggle/input' not in str(getattr(self.shards[i].stream, 'local', ''))
+        ]
+
+        if not evictable_shard_ids:
+            return
+
+        evictable_shard_ids = np.array(evictable_shard_ids, dtype=np.int64)
+        local_shard_times = access_times[evictable_shard_ids]
+        coldest_shard_id = int(evictable_shard_ids[np.argmin(local_shard_times)])
+        self._evict_shard(coldest_shard_id)
+
+    def _evict_shard(self, shard_id):
+        """Safely evict a remote shard while preventing deletion of read-only local mounts."""
+        shard = self.shards[shard_id]
+        if getattr(shard.stream, 'remote', None) is None or '/kaggle/input' in str(getattr(shard.stream, 'local', '')):
+            return
+
+        super()._evict_shard(shard_id)
+
     def __getitem__(self, idx):
         sample = super().__getitem__(idx)
 
@@ -295,6 +338,13 @@ def create_mds_dataloader(
 
     if transform is None:
         transform = get_train_transforms(height=height, width=width)
+
+    # If remote cloud streams are present, ensure cache_limit is set (default '15gb')
+    # to protect Kaggle disk space from overflowing (COCO ~113GB + BDD100K ~43GB)
+    has_remote = any(getattr(s, 'remote', None) is not None for s in streams)
+    if has_remote and cache_limit is None:
+        cache_limit = "15gb"
+        print("[Info] Remote cloud streams detected without cache_limit. Setting default cache_limit='15gb' to protect local disk.")
 
     dataset = MDSLargeScaleDepthDataset(
         streams=streams,
