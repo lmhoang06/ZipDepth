@@ -120,7 +120,11 @@ class ZipDepthTrainer:
         )
 
         # Compile student for faster iteration (PyTorch >= 2.0)
-        self.student = torch.compile(self.student, mode="reduce-overhead")
+        try:
+            self.student = torch.compile(self.student, mode="default")
+        except Exception as e:
+            if self.is_main:
+                print(f"[Warning] torch.compile failed or not supported: {e}. Falling back to eager mode.")
 
     def train(self, num_epochs: int, save_dir: str = './checkpoints', start_epoch: int = 0,
             save_every_steps: int = 0, max_step_checkpoints: int = 5, max_steps: int = 0):

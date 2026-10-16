@@ -169,20 +169,25 @@ def main(args):
         from zipdepth.data import create_mds_dataloader
         sources = args.streams_config if args.streams_config is not None else args.mds_dirs
         print_main(f"Using MosaicML Streaming data sources: {sources}", rank)
-        train_loader, train_dataset = create_mds_dataloader(
-            sources=sources,
-            height=args.height,
-            width=args.width,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            shuffle=True,
-            cache_limit=args.cache_limit,
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=(args.num_workers > 0),
-            prefetch_factor=1 if args.num_workers > 0 else None,
-            transform=train_transforms,
-        )
+        loader_kwargs = {
+            "sources": sources,
+            "height": args.height,
+            "width": args.width,
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "shuffle": True,
+            "cache_limit": args.cache_limit,
+            "pin_memory": True,
+            "drop_last": True,
+            "persistent_workers": (args.num_workers > 0),
+            "prefetch_factor": 1 if args.num_workers > 0 else None,
+            "transform": train_transforms,
+        }
+        if hasattr(args, 'shuffle_algo') and args.shuffle_algo:
+            loader_kwargs["shuffle_algo"] = args.shuffle_algo
+        if hasattr(args, 'predownload') and args.predownload is not None:
+            loader_kwargs["predownload"] = args.predownload
+        train_loader, train_dataset = create_mds_dataloader(**loader_kwargs)
         train_sampler = None
     else:
         train_dataset = LargeScaleDepthDataset(
@@ -463,6 +468,11 @@ if __name__ == '__main__':
                         help='Local disk cache limit for streaming from remote buckets (e.g. "5gb")')
     parser.add_argument('--domains', type=str, default=None,
                         help='Comma-separated domain filter (e.g. "kitti,nyu")')
+    parser.add_argument('--shuffle-algo', type=str, default='py1s',
+                        choices=['py1s', 'py1e', 'py2s'],
+                        help='MosaicML shuffle algorithm ("py1s" for shard-sequential to prevent cache thrashing, "py1e" for global block)')
+    parser.add_argument('--predownload', type=int, default=2,
+                        help='Number of shards/samples to predownload ahead of execution')
     parser.add_argument('--max-train-samples', type=int, default=None)
 
     # Training (override config)

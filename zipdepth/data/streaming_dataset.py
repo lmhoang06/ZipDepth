@@ -59,52 +59,61 @@ def _patch_streaming_hf_downloader():
             local_dirname = os.path.dirname(local)
             os.makedirs(local_dirname, exist_ok=True)
 
-            if os.path.isfile(local) and os.path.getsize(local) > 0:
-                return
+            lock_path = f"{local}.lock"
+            try:
+                from filelock import FileLock
+                lock = FileLock(lock_path, timeout=600)
+            except Exception:
+                from contextlib import nullcontext
+                lock = nullcontext()
 
-            token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-            if not token:
-                try:
-                    from kaggle_secrets import UserSecretsClient
-                    token = UserSecretsClient().get_secret("HF_TOKEN")
-                except Exception:
-                    pass
+            with lock:
+                if os.path.isfile(local) and os.path.getsize(local) > 0:
+                    return
 
-            headers = {"User-Agent": "ZipDepth-MosaicML-Streaming/1.0"}
-            if token and token.strip():
-                headers["Authorization"] = f"Bearer {token.strip()}"
+                token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+                if not token:
+                    try:
+                        from kaggle_secrets import UserSecretsClient
+                        token = UserSecretsClient().get_secret("HF_TOKEN")
+                    except Exception:
+                        pass
 
-            tmp_file = f"{local}.tmp.{os.getpid()}"
-            max_retries = 5
-            req_timeout = timeout if timeout and timeout > 0 else 180
+                headers = {"User-Agent": "ZipDepth-MosaicML-Streaming/1.0"}
+                if token and token.strip():
+                    headers["Authorization"] = f"Bearer {token.strip()}"
 
-            for attempt in range(max_retries):
-                try:
-                    with requests.get(cdn_url, headers=headers, stream=True, timeout=(15, req_timeout)) as resp:
-                        if resp.status_code == 429:
-                            retry_after = resp.headers.get("Retry-After")
-                            wait_time = float(retry_after) if retry_after else (2 ** attempt * 2 + random.uniform(1.0, 2.5))
-                            time.sleep(wait_time)
-                            continue
+                tmp_file = f"{local}.tmp.{os.getpid()}"
+                max_retries = 5
+                req_timeout = timeout if timeout and timeout > 0 else 180
 
-                        resp.raise_for_status()
+                for attempt in range(max_retries):
+                    try:
+                        with requests.get(cdn_url, headers=headers, stream=True, timeout=(15, req_timeout)) as resp:
+                            if resp.status_code == 429:
+                                retry_after = resp.headers.get("Retry-After")
+                                wait_time = float(retry_after) if retry_after else (2 ** attempt * 2 + random.uniform(1.0, 2.5))
+                                time.sleep(wait_time)
+                                continue
 
-                        with open(tmp_file, "wb") as f:
-                            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                                if chunk:
-                                    f.write(chunk)
+                            resp.raise_for_status()
 
-                        os.replace(tmp_file, local)
-                        return
-                except Exception as e:
-                    if os.path.exists(tmp_file):
-                        try:
-                            os.remove(tmp_file)
-                        except Exception:
-                            pass
-                    if attempt == max_retries - 1:
-                        raise e
-                    time.sleep(2 ** attempt * 1.5 + random.uniform(0.5, 1.5))
+                            with open(tmp_file, "wb") as f:
+                                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                                    if chunk:
+                                        f.write(chunk)
+
+                            os.replace(tmp_file, local)
+                            return
+                    except Exception as e:
+                        if os.path.exists(tmp_file):
+                            try:
+                                os.remove(tmp_file)
+                            except Exception:
+                                pass
+                        if attempt == max_retries - 1:
+                            raise e
+                        time.sleep(2 ** attempt * 1.5 + random.uniform(0.5, 1.5))
 
         HFDownloader._download_file_impl = _direct_cdn_download
     except Exception:
@@ -461,8 +470,12 @@ def create_mds_dataloader(
         cache_limit = "15gb"
         print("[Info] Remote cloud streams detected without cache_limit. Setting default cache_limit='15gb' to protect local disk.")
 
+    if has_remote and "shuffle_algo" not in kwargs:
+        kwargs["shuffle_algo"] = "py1s"
+        print("[Info] Remote cloud streams detected. Using shuffle_algo='py1s' (shard-sequential) to prevent cache thrashing.")
+
     if has_remote and "predownload" not in kwargs:
-        kwargs["predownload"] = max(batch_size, 32)
+        kwargs["predownload"] = 2
 
     dataset = MDSLargeScaleDepthDataset(
         streams=streams,
