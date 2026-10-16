@@ -476,8 +476,8 @@ if __name__ == '__main__':
     parser.add_argument('--shuffle-algo', type=str, default='py1s',
                         choices=['py1s', 'py1e', 'py2s'],
                         help='MosaicML shuffle algorithm ("py1s" for shard-sequential to prevent cache thrashing, "py1e" for global block)')
-    parser.add_argument('--predownload', type=int, default=2,
-                        help='Number of shards/samples to predownload ahead of execution')
+    parser.add_argument('--predownload', type=int, default=64,
+                        help='Number of samples to predownload ahead of execution (recommend >= batch_size)')
     parser.add_argument('--max-train-samples', type=int, default=None)
 
     # Training (override config)

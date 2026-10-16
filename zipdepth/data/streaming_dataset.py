@@ -475,7 +475,7 @@ def create_mds_dataloader(
         print("[Info] Remote cloud streams detected. Using shuffle_algo='py1s' (shard-sequential) to prevent cache thrashing.")
 
     if has_remote and "predownload" not in kwargs:
-        kwargs["predownload"] = 2
+        kwargs["predownload"] = max(batch_size, 64)
 
     dataset = MDSLargeScaleDepthDataset(
         streams=streams,
