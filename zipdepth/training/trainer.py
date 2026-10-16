@@ -150,13 +150,16 @@ class ZipDepthTrainer:
             total_iterations = min(total_iterations, max_steps - self.global_step)
 
         disable_tqdm = self.is_distributed and not self.is_main
+        is_interactive = sys.stdout.isatty()
+        min_interval = 0.5 if is_interactive else 5.0
         pbar = tqdm(
             total=total_iterations,
             desc='Training',
             disable=disable_tqdm,
             initial=0,
-            mininterval=0.5,
-            dynamic_ncols=True,
+            mininterval=min_interval,
+            dynamic_ncols=is_interactive,
+            ncols=100 if not is_interactive else None,
             bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
         )
 

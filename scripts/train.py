@@ -111,6 +111,11 @@ def main(args):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    # Prevent CPU over-subscription across processes on 4-vCPU environments (e.g. Kaggle)
+    cpu_cores = os.cpu_count() or 4
+    threads_per_proc = max(1, cpu_cores // max(1, world_size))
+    torch.set_num_threads(threads_per_proc)
+
     args.save_dir = args.save_dir.format(
         variant=args.model_variant,
         height=args.height,
