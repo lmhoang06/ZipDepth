@@ -477,8 +477,8 @@ if __name__ == '__main__':
     parser.add_argument('--shuffle-algo', type=str, default='py1s',
                         choices=['py1s', 'py1e', 'py2s'],
                         help='MosaicML shuffle algorithm ("py1s" for shard-sequential to prevent cache thrashing, "py1e" for global block)')
-    parser.add_argument('--predownload', type=int, default=64,
-                        help='Number of samples to predownload ahead of execution (recommend >= batch_size)')
+    parser.add_argument('--predownload', type=int, default=2000,
+                        help='Number of samples to predownload ahead of execution (recommend >= 2000 for 512MB shards)')
     parser.add_argument('--prefetch-factor', type=int, default=3,
                         help='Number of batches loaded in advance per worker (default: 3)')
     parser.add_argument('--max-train-samples', type=int, default=None)
