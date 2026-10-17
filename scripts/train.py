@@ -246,7 +246,8 @@ def main(args):
         total_steps = max_steps
         args.epochs = max(args.epochs, math.ceil(max_steps / steps_per_epoch))
     else:
-        total_steps = steps_per_epoch * args.epochs
+        # Include slight headroom (+50 steps) for streaming datasets where multi-stream DDP rounding can yield 1-2 extra batches
+        total_steps = (steps_per_epoch * args.epochs) + 50
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,

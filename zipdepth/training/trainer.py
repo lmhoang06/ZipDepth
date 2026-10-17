@@ -333,7 +333,10 @@ class ZipDepthTrainer:
                     self.optimizer.step()
 
                 if self.scheduler is not None:
-                    self.scheduler.step()
+                    try:
+                        self.scheduler.step()
+                    except (ValueError, IndexError):
+                        pass
 
                 self.optimizer.zero_grad(set_to_none=True)
 
