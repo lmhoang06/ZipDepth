@@ -190,6 +190,8 @@ def main(args):
         }
         if hasattr(args, 'shuffle_algo') and args.shuffle_algo:
             loader_kwargs["shuffle_algo"] = args.shuffle_algo
+        if hasattr(args, 'num_canonical_nodes') and args.num_canonical_nodes is not None:
+            loader_kwargs["num_canonical_nodes"] = args.num_canonical_nodes
         if hasattr(args, 'predownload') and args.predownload is not None:
             loader_kwargs["predownload"] = args.predownload
         train_loader, train_dataset = create_mds_dataloader(**loader_kwargs)
@@ -481,6 +483,8 @@ if __name__ == '__main__':
                         help='Number of samples to predownload ahead of execution (recommend >= 2000 for 512MB shards)')
     parser.add_argument('--prefetch-factor', type=int, default=3,
                         help='Number of batches loaded in advance per worker (default: 3)')
+    parser.add_argument('--num-canonical-nodes', type=int, default=1,
+                        help='Number of canonical nodes for shuffle partitioning (default 1 ensures strictly sequential shard reads)')
     parser.add_argument('--max-train-samples', type=int, default=None)
 
     # Training (override config)

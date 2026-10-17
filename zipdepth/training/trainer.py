@@ -324,15 +324,19 @@ class ZipDepthTrainer:
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=1.0, foreach=True)
+                    scale_before = self.scaler.get_scale()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    scale_after = self.scaler.get_scale()
+                    optimizer_stepped = (scale_before <= scale_after)
                 else:
                     # BF16 / FP32: no overflow risk, direct backward
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=1.0, foreach=True)
                     self.optimizer.step()
+                    optimizer_stepped = True
 
-                if self.scheduler is not None:
+                if self.scheduler is not None and optimizer_stepped:
                     try:
                         self.scheduler.step()
                     except (ValueError, IndexError):

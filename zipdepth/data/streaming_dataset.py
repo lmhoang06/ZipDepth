@@ -474,6 +474,9 @@ def create_mds_dataloader(
         kwargs["shuffle_algo"] = "py1s"
         print("[Info] Remote cloud streams detected. Using shuffle_algo='py1s' (shard-sequential) to prevent cache thrashing.")
 
+    if has_remote and "num_canonical_nodes" not in kwargs:
+        kwargs["num_canonical_nodes"] = 1
+
     if has_remote and "predownload" not in kwargs:
         kwargs["predownload"] = max(batch_size * 8, 2000)
 
