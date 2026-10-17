@@ -185,7 +185,7 @@ def main(args):
             "pin_memory": True,
             "drop_last": True,
             "persistent_workers": (args.num_workers > 0),
-            "prefetch_factor": 1 if args.num_workers > 0 else None,
+            "prefetch_factor": getattr(args, 'prefetch_factor', 3) if args.num_workers > 0 else None,
             "transform": train_transforms,
         }
         if hasattr(args, 'shuffle_algo') and args.shuffle_algo:
@@ -479,6 +479,8 @@ if __name__ == '__main__':
                         help='MosaicML shuffle algorithm ("py1s" for shard-sequential to prevent cache thrashing, "py1e" for global block)')
     parser.add_argument('--predownload', type=int, default=64,
                         help='Number of samples to predownload ahead of execution (recommend >= batch_size)')
+    parser.add_argument('--prefetch-factor', type=int, default=3,
+                        help='Number of batches loaded in advance per worker (default: 3)')
     parser.add_argument('--max-train-samples', type=int, default=None)
 
     # Training (override config)
