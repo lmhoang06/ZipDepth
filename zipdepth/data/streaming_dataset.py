@@ -489,9 +489,13 @@ def create_mds_dataloader(
         **kwargs
     )
 
-    # Note: StreamingDataset natively coordinates sample splitting across DDP ranks.
-    # Therefore, we do NOT use an external DistributedSampler.
-    loader = DataLoader(
+    if STREAMING_AVAILABLE:
+        from streaming import StreamingDataLoader
+        loader_cls = StreamingDataLoader
+    else:
+        loader_cls = DataLoader
+
+    loader = loader_cls(
         dataset,
         batch_size=batch_size,
         shuffle=False,  # Shuffling is handled internally by StreamingDataset

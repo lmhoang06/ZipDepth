@@ -160,7 +160,7 @@ class ZipDepthTrainer:
             initial=0,
             mininterval=min_interval,
             dynamic_ncols=is_interactive,
-            ncols=100 if not is_interactive else None,
+            ncols=None,
             bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
         )
 
@@ -394,7 +394,7 @@ class ZipDepthTrainer:
                 if self.save_every_steps > 0 and self.global_step % self.save_every_steps == 0 and self.is_main:
                     ckpt_path = os.path.join(self.save_dir, f'step_{self.global_step}.pth')
                     self.save_checkpoint(ckpt_path, epoch, loss_value)
-                    print(f'\n  -> Checkpoint saved at step {self.global_step}')
+                    tqdm.write(f'  -> Checkpoint saved at step {self.global_step}')
                     self.cleanup_step_checkpoints()
 
                 del student_depth, teacher_depth, loss
