@@ -192,6 +192,8 @@ def main(args):
             loader_kwargs["shuffle_algo"] = args.shuffle_algo
         if hasattr(args, 'num_canonical_nodes') and args.num_canonical_nodes is not None:
             loader_kwargs["num_canonical_nodes"] = args.num_canonical_nodes
+        if hasattr(args, 'shuffle_block_size') and args.shuffle_block_size is not None:
+            loader_kwargs["shuffle_block_size"] = args.shuffle_block_size
         if hasattr(args, 'predownload') and args.predownload is not None:
             loader_kwargs["predownload"] = args.predownload
         train_loader, train_dataset = create_mds_dataloader(**loader_kwargs)
@@ -476,9 +478,11 @@ if __name__ == '__main__':
                         help='Local disk cache limit for streaming from remote buckets (e.g. "5gb")')
     parser.add_argument('--domains', type=str, default=None,
                         help='Comma-separated domain filter (e.g. "kitti,nyu")')
-    parser.add_argument('--shuffle-algo', type=str, default='py1s',
+    parser.add_argument('--shuffle-algo', type=str, default='py1e',
                         choices=['py1s', 'py1e', 'py2s'],
-                        help='MosaicML shuffle algorithm ("py1s" for shard-sequential to prevent cache thrashing, "py1e" for global block)')
+                        help='MosaicML shuffle algorithm ("py1e" for block-random multi-domain mixing, "py1s" for shard-sequential)')
+    parser.add_argument('--shuffle-block-size', type=int, default=16384,
+                        help='Block size for py1e shuffling (default: 16384 samples ~ 14 shards ~ 7GB, safe for Kaggle/Colab)')
     parser.add_argument('--predownload', type=int, default=2000,
                         help='Number of samples to predownload ahead of execution (recommend >= 2000 for 512MB shards)')
     parser.add_argument('--prefetch-factor', type=int, default=3,

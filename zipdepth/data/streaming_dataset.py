@@ -471,8 +471,12 @@ def create_mds_dataloader(
         print("[Info] Remote cloud streams detected without cache_limit. Setting default cache_limit='15gb' to protect local disk.")
 
     if has_remote and "shuffle_algo" not in kwargs:
-        kwargs["shuffle_algo"] = "py1s"
-        print("[Info] Remote cloud streams detected. Using shuffle_algo='py1s' (shard-sequential) to prevent cache thrashing.")
+        kwargs["shuffle_algo"] = "py1e"
+        print("[Info] Remote cloud streams detected. Using shuffle_algo='py1e' (block-random multi-domain mixing).")
+
+    if kwargs.get("shuffle_algo") == "py1e" and "shuffle_block_size" not in kwargs:
+        kwargs["shuffle_block_size"] = 16384
+        print("[Info] Setting shuffle_block_size=16384 (~14 shards / ~7GB active) for safe bounded multi-domain mixing.")
 
     if has_remote and "num_canonical_nodes" not in kwargs:
         kwargs["num_canonical_nodes"] = 1

@@ -367,7 +367,7 @@ class ZipDepthTrainer:
 
                 # Logging
                 if self.is_main and self.writer is not None:
-                    if self.global_step % 750 == 0:
+                    if self.global_step % 50 == 0:
                         self.writer.add_scalar('train/loss', loss.item(), self.global_step)
                         self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
                         self.writer.add_scalar('train/loss_ssi', loss_dict['ssi'], self.global_step)
