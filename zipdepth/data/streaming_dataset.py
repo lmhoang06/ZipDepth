@@ -499,6 +499,18 @@ def create_mds_dataloader(
     else:
         loader_cls = DataLoader
 
+    def _streaming_worker_init_fn(worker_id):
+        try:
+            import cv2
+            cv2.setNumThreads(0)
+        except Exception:
+            pass
+        try:
+            import torch
+            torch.set_num_threads(1)
+        except Exception:
+            pass
+
     loader = loader_cls(
         dataset,
         batch_size=batch_size,
@@ -508,6 +520,7 @@ def create_mds_dataloader(
         drop_last=drop_last,
         persistent_workers=(num_workers > 0 and persistent_workers),
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        worker_init_fn=_streaming_worker_init_fn if num_workers > 0 else None,
     )
 
     return loader, dataset
