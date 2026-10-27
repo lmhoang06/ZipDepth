@@ -329,7 +329,7 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
         )
 
         # In hybrid setups (local mounted + cloud streaming), subtract read-only local mounts
-        # (/kaggle/input) from cache_usage so cache_limit strictly bounds the remote downloads.
+        # (/kaggle/input, /content/drive) from cache_usage so cache_limit strictly bounds the remote downloads.
         if getattr(self, 'cache_limit', None) and getattr(getattr(self, '_unique_rank_world', None), 'is_local_leader', True):
             readonly_bytes = 0
             for shard_id, shard in enumerate(getattr(self, 'shards', [])):
@@ -337,7 +337,8 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
                     size_fn = getattr(shard, 'get_raw_size', None)
                     readonly_bytes += size_fn() if callable(size_fn) else getattr(shard, 'raw_size', 0)
             for stream in getattr(self, 'streams', []):
-                if getattr(stream, 'remote', None) is None or '/kaggle/input' in str(getattr(stream, 'local', '')):
+                loc = str(getattr(stream, 'local', ''))
+                if getattr(stream, 'remote', None) is None or '/kaggle/input' in loc or '/content/drive' in loc:
                     index_fn = getattr(stream, 'get_index_size', None)
                     if callable(index_fn):
                         readonly_bytes += index_fn()
@@ -350,7 +351,8 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
             try:
                 stream_id = self.stream_per_shard[shard_id]
                 stream = self.streams[stream_id]
-                if getattr(stream, 'remote', None) is None or '/kaggle/input' in str(getattr(stream, 'local', '')):
+                loc = str(getattr(stream, 'local', ''))
+                if getattr(stream, 'remote', None) is None or '/kaggle/input' in loc or '/content/drive' in loc:
                     return True
             except Exception:
                 pass
@@ -359,7 +361,7 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
             shard = self.shards[shard_id]
             dirname = str(getattr(shard, 'dirname', ''))
             raw_fn = str(getattr(shard, 'raw_filename', ''))
-            if '/kaggle/input' in dirname or '/kaggle/input' in raw_fn:
+            if any(p in dirname or p in raw_fn for p in ['/kaggle/input', '/content/drive']):
                 return True
 
         return False
