@@ -120,28 +120,10 @@ def _patch_streaming_hf_downloader():
         pass
 
 
-def _patch_streaming_download():
-    """Patches CloudDownloader.download to clean up 0-byte or corrupted files before download."""
-    try:
-        from streaming.base.storage.download import CloudDownloader
-        orig_download = CloudDownloader.download
-
-        def safe_download(self, remote, local, timeout=60):
-            if os.path.exists(local) and os.path.getsize(local) < 16:
-                try:
-                    os.remove(local)
-                except Exception:
-                    pass
-            orig_download(self, remote, local, timeout)
-
-        CloudDownloader.download = safe_download
-    except Exception:
-        pass
-
-
 def _patch_mds_reader():
-    """Patches MDSReader.get_sample_data to detect 0-byte/corrupted shards and give clear diagnostics."""
+    """Patches MDSReader.get_sample_data to detect 0-byte/corrupted shards and raise clear warnings and diagnostics."""
     try:
+        import warnings
         from streaming.base.format.mds.reader import MDSReader
         orig_get_sample_data = MDSReader.get_sample_data
 
@@ -151,14 +133,12 @@ def _patch_mds_reader():
                 raise FileNotFoundError(f"MDS shard file does not exist: '{filename}'")
             sz = os.path.getsize(filename)
             if sz < 16:
-                if "/tmp/" in filename or "/stream_cache/" in filename:
-                    try:
-                        os.remove(filename)
-                    except Exception:
-                        pass
+                warnings.warn(
+                    f"Integrity Warning: Shard file '{filename}' is empty or incomplete (size={sz} bytes)."
+                )
                 raise ValueError(
                     f"Corrupted or empty MDS shard: '{filename}' (size={sz} bytes). "
-                    f"Please delete this corrupted shard and re-download/re-stream."
+                    f"The shard must be re-downloaded to restore dataset integrity."
                 )
             try:
                 return orig_get_sample_data(self, idx)
@@ -172,7 +152,6 @@ def _patch_mds_reader():
 
 if STREAMING_AVAILABLE:
     _patch_streaming_hf_downloader()
-    _patch_streaming_download()
     _patch_mds_reader()
 
 try:
