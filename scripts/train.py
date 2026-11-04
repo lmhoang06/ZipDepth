@@ -394,7 +394,7 @@ def main(args):
             model_params = model.module.parameters() if is_distributed else model.parameters()
             optimizer = optim.AdamW(model_params, lr=base_lr, weight_decay=args.weight_decay)
             total_steps = args.epochs * len(train_loader)
-            warmup_steps = 3000
+            warmup_steps = max(10, min(1000, len(train_loader) // 2))
             scheduler = optim.lr_scheduler.SequentialLR(
                 optimizer,
                 [optim.lr_scheduler.LinearLR(optimizer, 0.1, 1.0, warmup_steps),
