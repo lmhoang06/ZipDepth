@@ -60,8 +60,15 @@ def merge_config_args(cfg: dict, args: argparse.Namespace) -> argparse.Namespace
     defaults = {
         'model_variant':       cfg.get('model', {}).get('variant', 'base'),
         'upsample_unfold':     cfg.get('model', {}).get('upsample_unfold', True),
+        'loss_type':           cfg.get('loss', {}).get('type', 'original'),
         'alpha_ssi':           cfg.get('loss', {}).get('alpha_ssi', 1.0),
         'alpha_grad':          cfg.get('loss', {}).get('alpha_grad', 2.0),
+        'alpha_hdn':           cfg.get('loss', {}).get('alpha_hdn', 1.0),
+        'alpha_normal':        cfg.get('loss', {}).get('alpha_normal', 0.5),
+        'trim_ratio':          cfg.get('loss', {}).get('trim_ratio', 0.10),
+        'hdn_mode':            cfg.get('loss', {}).get('hdn_mode', 'dp'),
+        'hdn_segments':        cfg.get('loss', {}).get('hdn_segments', (2, 4)),
+        'normal_beta':         cfg.get('loss', {}).get('normal_beta', 1.0),
 
         'height':              cfg.get('data', {}).get('height', 512),
         'width':               cfg.get('data', {}).get('width', 512),
@@ -97,6 +104,8 @@ def merge_config_args(cfg: dict, args: argparse.Namespace) -> argparse.Namespace
     for key, value in defaults.items():
         if not hasattr(args, key) or getattr(args, key) is None:
             setattr(args, key, value)
+    if hasattr(args, 'hdn_segments') and isinstance(args.hdn_segments, str):
+        args.hdn_segments = tuple(int(x.strip()) for x in args.hdn_segments.split(',') if x.strip())
     return args
 
 
@@ -296,8 +305,15 @@ def main(args):
         profile_active=args.profile_active,
         profile_repeat=args.profile_repeat,
         amp_dtype=args.amp_dtype,
+        loss_type=args.loss_type,
         alpha_ssi=args.alpha_ssi,
         alpha_grad=args.alpha_grad,
+        alpha_hdn=args.alpha_hdn,
+        alpha_normal=args.alpha_normal,
+        trim_ratio=args.trim_ratio,
+        hdn_mode=args.hdn_mode,
+        hdn_segments=args.hdn_segments,
+        normal_beta=args.normal_beta,
     )
 
     # ========================================================================
@@ -307,7 +323,10 @@ def main(args):
     print_main("TRAINING CONFIGURATION", rank)
     print_main(f"{'='*80}", rank)
     print_main(f"Model:           {args.model_variant}", rank)
-    print_main(f"Loss:            SSI x{args.alpha_ssi} + Grad x{args.alpha_grad}", rank)
+    if args.loss_type == 'hdn':
+        print_main(f"Loss:            HDN (SSI x{args.alpha_ssi} + HDN x{args.alpha_hdn} + Grad x{args.alpha_grad} + Norm x{args.alpha_normal}, trim={args.trim_ratio}, mode={args.hdn_mode})", rank)
+    else:
+        print_main(f"Loss:            Original (SSI x{args.alpha_ssi} + Grad x{args.alpha_grad})", rank)
     print_main(f"Input size:      {args.height}x{args.width}", rank)
     print_main(f"Samples:         {len(train_dataset):,}", rank)
     print_main(f"Batches/epoch:   {len(train_loader):,}", rank)
@@ -502,6 +521,27 @@ if __name__ == '__main__':
                         help='Stop after this many gradient updates (overrides epoch count for scheduler too)')
     parser.add_argument('--height', type=int, default=None)
     parser.add_argument('--width', type=int, default=None)
+
+    # Loss (override config)
+    parser.add_argument('--loss-type', type=str, default=None,
+                        choices=['original', 'hdn'],
+                        help='Loss function: "original" (ZipDepthLoss) or "hdn" (HDNDistillationLoss)')
+    parser.add_argument('--alpha-ssi', type=float, default=None,
+                        help='Weight for SSI loss component')
+    parser.add_argument('--alpha-grad', type=float, default=None,
+                        help='Weight for multi-scale gradient loss')
+    parser.add_argument('--alpha-hdn', type=float, default=None,
+                        help='Weight for Hybrid Depth Normalization loss (HDN)')
+    parser.add_argument('--alpha-normal', type=float, default=None,
+                        help='Weight for 2D disparity virtual surface normal loss')
+    parser.add_argument('--trim-ratio', type=float, default=None,
+                        help='Quantile trimming ratio (default: 0.10 drops top 10%% outliers)')
+    parser.add_argument('--hdn-mode', type=str, default=None, choices=['dp', 'dr'],
+                        help='HDN mode: "dp" (depth quantiles) or "dr" (uniform depth ranges)')
+    parser.add_argument('--hdn-segments', type=str, default=None,
+                        help='Comma-separated segment counts for HDN (e.g. "2,4")')
+    parser.add_argument('--normal-beta', type=float, default=None,
+                        help='Sensitivity factor for surface normals (default: 1.0)')
 
     # Resume
     parser.add_argument('--resume', type=str, default=None)

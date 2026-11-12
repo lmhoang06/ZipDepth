@@ -58,8 +58,11 @@ class ZipDepthTrainer:
                 profile_active=5,
                 profile_repeat=1,
                 amp_dtype='bfloat16',
-                alpha_ssi: float = 1.0,
-                alpha_grad: float = 2.0,
+                alpha_ssi=1.0,
+                alpha_grad=2.0,
+                loss_type='original',
+                criterion=None,
+                **loss_kwargs,
                 ):
         """
         Args:
@@ -84,6 +87,8 @@ class ZipDepthTrainer:
                        or 'float16' (requires GradScaler, narrower range)
             alpha_ssi: Weight for SSI loss component
             alpha_grad: Weight for gradient loss component
+            loss_type: 'original' (ZipDepthLoss) or 'hdn' (HDNDistillationLoss)
+            criterion: Optional custom loss instance to override default creation
         """
         self.student = student.to(device)
         self.train_loader = train_loader
@@ -111,7 +116,16 @@ class ZipDepthTrainer:
         self._loader_config = None
 
         # Loss function initialization
-        self.criterion = ZipDepthLoss(alpha_ssi=alpha_ssi, alpha_grad=alpha_grad).to(device)
+        if criterion is not None:
+            self.criterion = criterion.to(device)
+        else:
+            from zipdepth.loss import create_loss
+            loss_params = {
+                'alpha_ssi': alpha_ssi,
+                'alpha_grad': alpha_grad,
+            }
+            loss_params.update(loss_kwargs)
+            self.criterion = create_loss(loss_type=loss_type, **loss_params).to(device)
 
         # GradScaler only needed for FP16 — BF16 has FP32-range exponents so no overflow
         self.scaler = (
@@ -357,21 +371,24 @@ class ZipDepthTrainer:
 
                 if not disable_tqdm:
                     pbar.update(1)
-                    pbar.set_postfix({
+                    postfix_dict = {
                         'E': f"{epoch+1}/{num_epochs}",
                         'B': f"{batch_idx+1}/{num_batches}",
                         'loss': f"{loss_value:.3f}",
                         'avg_loss': f"{avg_loss:.3f}",
-                        'ssi': f"{loss_dict['ssi']:.3f}",
-                    })
+                        'ssi': f"{loss_dict.get('ssi', 0.0):.3f}",
+                    }
+                    if 'hdn' in loss_dict:
+                        postfix_dict['hdn'] = f"{loss_dict['hdn']:.3f}"
+                    pbar.set_postfix(postfix_dict)
 
                 # Logging
                 if self.is_main and self.writer is not None:
                     if self.global_step % 50 == 0:
                         self.writer.add_scalar('train/loss', loss.item(), self.global_step)
                         self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
-                        self.writer.add_scalar('train/loss_ssi', loss_dict['ssi'], self.global_step)
-                        self.writer.add_scalar('train/loss_grad', loss_dict['grad'], self.global_step)
+                        for k, v in loss_dict.items():
+                            self.writer.add_scalar(f'train/loss_{k}', v, self.global_step)
 
                     if self.global_step % 750 == 0:
                         n_show = min(6, images.size(0))
