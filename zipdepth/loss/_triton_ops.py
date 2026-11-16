@@ -286,16 +286,48 @@ if HAS_TRITON:
         tl.store(out_gs_ptr + idx, tl.sum(tl.where(in_b, sgn, 0.0), axis=0))
 
     @triton.jit
+    def _norm_bwd_reduce_kernel(
+        g1_part_ptr,
+        g2_part_ptr,
+        gs_part_ptr,
+        p_mad_ptr,
+        denom_ptr,
+        out_coeff_ptr,
+        out_gmed_ptr,
+        out_ps_ptr,
+        B,
+        num_tiles,
+    ):
+        b = tl.program_id(0)
+        base = b * num_tiles
+        g1 = tl.zeros((), dtype=tl.float32)
+        g2 = tl.zeros((), dtype=tl.float32)
+        gs = tl.zeros((), dtype=tl.float32)
+        for t_i in range(num_tiles):
+            g1 += tl.load(g1_part_ptr + base + t_i).to(tl.float32)
+            g2 += tl.load(g2_part_ptr + base + t_i).to(tl.float32)
+            gs += tl.load(gs_part_ptr + base + t_i).to(tl.float32)
+        pmad = tl.load(p_mad_ptr + b).to(tl.float32)
+        ps = tl.maximum(pmad, 1e-6)
+        M = tl.load(denom_ptr + b).to(tl.float32)
+        not_clamped = pmad >= 1e-6
+        coeff = (g2 / (ps * M)) if not_clamped else 0.0
+        gmed = (-g1 + (gs * coeff if not_clamped else 0.0)) / ps
+        tl.store(out_coeff_ptr + b, coeff)
+        tl.store(out_gmed_ptr + b, gmed)
+        tl.store(out_ps_ptr + b, ps)
+
+    @triton.jit
     def _norm_bwd_write_kernel(
         p_ptr,
         m_ptr,
         dphat_ptr,
         grad_p_ptr,
         p_med_ptr,
-        p_mad_ptr,
-        mad_clamped_ptr,
-        g2_ptr,
-        denom_ptr,
+        p_idx_ptr,
+        coeff_ptr,
+        gmed_ptr,
+        ps_ptr,
         B,
         N,
         HAS_MASK: tl.constexpr,
@@ -308,11 +340,10 @@ if HAS_TRITON:
         base = b * N
 
         pm = tl.load(p_med_ptr + b).to(tl.float32)
-        ps = tl.maximum(tl.load(p_mad_ptr + b).to(tl.float32), 1e-6)
-        not_clamped = tl.load(mad_clamped_ptr + b).to(tl.float32) == 0.0
-        g2_raw = tl.load(g2_ptr + b).to(tl.float32)
-        denom = tl.load(denom_ptr + b).to(tl.float32)
-        coeff = (g2_raw / (ps * denom)) if not_clamped else 0.0
+        p_idx = tl.load(p_idx_ptr + b)
+        coeff = tl.load(coeff_ptr + b).to(tl.float32)
+        gmed = tl.load(gmed_ptr + b).to(tl.float32)
+        ps = tl.load(ps_ptr + b).to(tl.float32)
 
         pv = tl.load(p_ptr + base + offs, mask=in_b, other=0.0).to(tl.float32)
         dp = tl.load(dphat_ptr + base + offs, mask=in_b, other=0.0).to(tl.float32)
@@ -321,7 +352,9 @@ if HAS_TRITON:
         if HAS_MASK:
             mv = tl.load(m_ptr + base + offs, mask=in_b, other=0.0).to(tl.float32)
             sgn = sgn * tl.abs(mv)
-        tl.store(grad_p_ptr + base + offs, (dp - coeff * sgn) / ps, mask=in_b)
+        gp = (dp - coeff * sgn) / ps
+        gp += tl.where(offs == p_idx, gmed, 0.0)
+        tl.store(grad_p_ptr + base + offs, gp.to(grad_p_ptr.dtype.element_ty), mask=in_b)
 
     @triton.jit
     def _ssi_fwd_tile_kernel(
@@ -490,6 +523,7 @@ if HAS_TRITON:
         N,
         G,
         HAS_MASK: tl.constexpr,
+        PRE_TMED: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
         """Per-(b, g) segment median and MAD over contiguous sorted slices."""
@@ -553,7 +587,10 @@ if HAS_TRITON:
             c_f = valid_count.to(tl.float32)
         else:
             k_rem_p = (raw_count - 1) // 2
-            t_med = tl.load(t_sorted_ptr + base + seg_start + k_rem_p).to(tl.float32)
+            if PRE_TMED:
+                t_med = tl.load(out_t_med_ptr + bg).to(tl.float32)
+            else:
+                t_med = tl.load(t_sorted_ptr + base + seg_start + k_rem_p).to(tl.float32)
             c_f = raw_count.to(tl.float32)
 
         prefix_p = tl.zeros((), dtype=tl.uint32)
@@ -858,22 +895,79 @@ if HAS_TRITON:
             tl.store(out_norm_ptr + pid, tl.sum((1.0 - cos_sim) * mxy, axis=0))
 
     @triton.jit
+    def _pool2x_pair_kernel(
+        p_in_ptr,
+        t_in_ptr,
+        m_in_ptr,
+        p_out_ptr,
+        t_out_ptr,
+        m_out_ptr,
+        B,
+        H_in,
+        W_in,
+        H_out,
+        W_out,
+        HAS_MASK: tl.constexpr,
+        BLOCK_X: tl.constexpr,
+    ):
+        """Downsample (p, t[, m]) by 2x2 average in one pass matching F.avg_pool2d(..., 2)."""
+        pid = tl.program_id(0)
+        num_xb = tl.cdiv(W_out, BLOCK_X)
+        b = pid // (H_out * num_xb)
+        rem = pid % (H_out * num_xb)
+        y = rem // num_xb
+        xb = rem % num_xb
+
+        ox = xb * BLOCK_X + tl.arange(0, BLOCK_X)
+        in_w = ox < W_out
+        base_in0 = (b * H_in + 2 * y) * W_in
+        base_in1 = base_in0 + W_in
+        x0 = 2 * ox
+        x1 = x0 + 1
+
+        p00 = tl.load(p_in_ptr + base_in0 + x0, mask=in_w, other=0.0).to(tl.float32)
+        p01 = tl.load(p_in_ptr + base_in0 + x1, mask=in_w, other=0.0).to(tl.float32)
+        p10 = tl.load(p_in_ptr + base_in1 + x0, mask=in_w, other=0.0).to(tl.float32)
+        p11 = tl.load(p_in_ptr + base_in1 + x1, mask=in_w, other=0.0).to(tl.float32)
+
+        t00 = tl.load(t_in_ptr + base_in0 + x0, mask=in_w, other=0.0).to(tl.float32)
+        t01 = tl.load(t_in_ptr + base_in0 + x1, mask=in_w, other=0.0).to(tl.float32)
+        t10 = tl.load(t_in_ptr + base_in1 + x0, mask=in_w, other=0.0).to(tl.float32)
+        t11 = tl.load(t_in_ptr + base_in1 + x1, mask=in_w, other=0.0).to(tl.float32)
+
+        out_off = (b * H_out + y) * W_out + ox
+        tl.store(p_out_ptr + out_off, 0.25 * (p00 + p01 + p10 + p11), mask=in_w)
+        tl.store(t_out_ptr + out_off, 0.25 * (t00 + t01 + t10 + t11), mask=in_w)
+
+        if HAS_MASK:
+            m00 = tl.load(m_in_ptr + base_in0 + x0, mask=in_w, other=0.0).to(tl.float32)
+            m01 = tl.load(m_in_ptr + base_in0 + x1, mask=in_w, other=0.0).to(tl.float32)
+            m10 = tl.load(m_in_ptr + base_in1 + x0, mask=in_w, other=0.0).to(tl.float32)
+            m11 = tl.load(m_in_ptr + base_in1 + x1, mask=in_w, other=0.0).to(tl.float32)
+            m_avg = 0.25 * (m00 + m01 + m10 + m11)
+            tl.store(m_out_ptr + out_off, tl.where(m_avg > 0.99, 1.0, 0.0), mask=in_w)
+
+    @triton.jit
     def _grad_norm_bwd_kernel(
         p_ptr,
         t_ptr,
         m_ptr,
+        up_grad_ptr,
         grad_p_ptr,
         w_grad_ptr,
         w_norm_ptr,
         B,
         H,
         W,
+        H_up,
+        W_up,
         stride_b,
         stride_h,
         stride_w,
         normal_beta,
         HAS_MASK: tl.constexpr,
         COMPUTE_NORMAL: tl.constexpr,
+        ADD_UP: tl.constexpr,
         BLOCK_W: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -985,7 +1079,424 @@ if HAS_TRITON:
             dpy_u = (w_norm * normal_beta * mxy_u) * rp_u * (cos_u * py_u * rp_u - ty_u * rt_u)
             gp += dpy_u
 
+        if ADD_UP:
+            y_up = y // 2
+            x_up = offs_x // 2
+            in_up = in_w & (y_up < H_up) & (x_up < W_up)
+            gp += 0.25 * tl.load(
+                up_grad_ptr + (b * H_up + y_up) * W_up + x_up,
+                mask=in_up,
+                other=0.0,
+            ).to(tl.float32)
+
         tl.store(grad_p_ptr + base + offs_x * stride_w, gp, mask=in_w)
+
+    @triton.jit
+    def _q3_packed1024_kernel(
+        x_ptr,
+        out_q_ptr,
+        B,
+        N,
+        k0,
+        k1,
+        k2,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Find exact (q25, q50, q75) lower-rank order statistics per batch row without sorting."""
+        b = tl.program_id(0)
+        base = b * N
+        kr0 = k0
+        kr1 = k1
+        kr2 = k2
+        idx_256 = tl.arange(0, 256)
+        keep_lo = (1 - tl.arange(0, 2))[:, None]
+
+        h_init = tl.zeros([256], dtype=tl.int32)
+        for start in range(0, N, BLOCK_N):
+            offs = start + tl.arange(0, BLOCK_N)
+            in_b = offs < N
+            val = tl.load(x_ptr + base + offs, mask=in_b, other=0.0).to(tl.float32)
+            val = tl.where(val == 0.0, 0.0, val)
+            u = val.to(tl.uint32, bitcast=True)
+            key = u ^ tl.where(
+                (u >> 31) != 0,
+                tl.full([BLOCK_N], 0xFFFFFFFF, tl.uint32),
+                tl.full([BLOCK_N], 0x80000000, tl.uint32),
+            )
+            bv = tl.where(in_b, ((key >> 24) & 0xFF).to(tl.int32), 256)
+            h_init += tl.sum(tl.reshape(tl.histogram(bv, 512), [2, 256]) * keep_lo, axis=0)
+
+        c_i = tl.cumsum(h_init, axis=0)
+        bk0 = tl.argmax((c_i > kr0).to(tl.int32), axis=0)
+        kr0 -= tl.sum(tl.where(idx_256 == (bk0 - 1), c_i, 0), axis=0)
+        p0 = bk0.to(tl.uint32) << 24
+        bk1 = tl.argmax((c_i > kr1).to(tl.int32), axis=0)
+        kr1 -= tl.sum(tl.where(idx_256 == (bk1 - 1), c_i, 0), axis=0)
+        p1 = bk1.to(tl.uint32) << 24
+        bk2 = tl.argmax((c_i > kr2).to(tl.int32), axis=0)
+        kr2 -= tl.sum(tl.where(idx_256 == (bk2 - 1), c_i, 0), axis=0)
+        p2 = bk2.to(tl.uint32) << 24
+        mp = tl.full((), 0xFF000000, tl.uint32)
+
+        rows_4 = tl.arange(0, 4)[:, None]
+        for pass_i in tl.static_range(1, 4):
+            shift = 24 - 8 * pass_i
+            h0 = tl.zeros([256], dtype=tl.int32)
+            h1 = tl.zeros([256], dtype=tl.int32)
+            h2 = tl.zeros([256], dtype=tl.int32)
+            same01 = p1 == p0
+            same02 = p2 == p0
+            same12 = p2 == p1
+            for start in range(0, N, BLOCK_N):
+                offs = start + tl.arange(0, BLOCK_N)
+                in_b = offs < N
+                val = tl.load(x_ptr + base + offs, mask=in_b, other=0.0).to(tl.float32)
+                val = tl.where(val == 0.0, 0.0, val)
+                u = val.to(tl.uint32, bitcast=True)
+                key = u ^ tl.where(
+                    (u >> 31) != 0,
+                    tl.full([BLOCK_N], 0xFFFFFFFF, tl.uint32),
+                    tl.full([BLOCK_N], 0x80000000, tl.uint32),
+                )
+                km = key & mp
+                bs = ((key >> shift) & 0xFF).to(tl.int32)
+                slot = tl.where(km == p0, 0, tl.where(km == p1, 256, tl.where(km == p2, 512, 768)))
+                bval = tl.where(in_b, slot + bs, 768)
+                hr = tl.reshape(tl.histogram(bval, 1024), [4, 256])
+                h0 += tl.sum(tl.where(rows_4 == 0, hr, 0), axis=0)
+                h1 += tl.sum(tl.where(rows_4 == 1, hr, 0), axis=0)
+                h2 += tl.sum(tl.where(rows_4 == 2, hr, 0), axis=0)
+
+            if same01:
+                h1 = h0
+            if same02:
+                h2 = h0
+            elif same12:
+                h2 = h1
+
+            c0 = tl.cumsum(h0, axis=0)
+            bk0 = tl.argmax((c0 > kr0).to(tl.int32), axis=0)
+            kr0 -= tl.sum(tl.where(idx_256 == (bk0 - 1), c0, 0), axis=0)
+            p0 |= bk0.to(tl.uint32) << shift
+
+            c1 = tl.cumsum(h1, axis=0)
+            bk1 = tl.argmax((c1 > kr1).to(tl.int32), axis=0)
+            kr1 -= tl.sum(tl.where(idx_256 == (bk1 - 1), c1, 0), axis=0)
+            p1 |= bk1.to(tl.uint32) << shift
+
+            c2 = tl.cumsum(h2, axis=0)
+            bk2 = tl.argmax((c2 > kr2).to(tl.int32), axis=0)
+            kr2 -= tl.sum(tl.where(idx_256 == (bk2 - 1), c2, 0), axis=0)
+            p2 |= bk2.to(tl.uint32) << shift
+
+            mp |= tl.full((), 0xFF, tl.uint32) << shift
+
+        inv0 = p0 ^ tl.where((p0 >> 31) == 0, tl.full((), 0xFFFFFFFF, tl.uint32), tl.full((), 0x80000000, tl.uint32))
+        inv1 = p1 ^ tl.where((p1 >> 31) == 0, tl.full((), 0xFFFFFFFF, tl.uint32), tl.full((), 0x80000000, tl.uint32))
+        inv2 = p2 ^ tl.where((p2 >> 31) == 0, tl.full((), 0xFFFFFFFF, tl.uint32), tl.full((), 0x80000000, tl.uint32))
+        tl.store(out_q_ptr + b * 3 + 0, inv0.to(tl.float32, bitcast=True))
+        tl.store(out_q_ptr + b * 3 + 1, inv1.to(tl.float32, bitcast=True))
+        tl.store(out_q_ptr + b * 3 + 2, inv2.to(tl.float32, bitcast=True))
+
+    @triton.jit
+    def _dr_bounds_kernel(
+        x_ptr,
+        out_q_ptr,
+        B,
+        N,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Compute uniform min/max 4-bin split thresholds [q0, q1, q2] for HDN-DR mode."""
+        b = tl.program_id(0)
+        base = b * N
+        tmin = tl.full((), 1e38, dtype=tl.float32)
+        tmax = tl.full((), -1e38, dtype=tl.float32)
+        for start in range(0, N, BLOCK_N):
+            offs = start + tl.arange(0, BLOCK_N)
+            in_b = offs < N
+            v_lo = tl.load(x_ptr + base + offs, mask=in_b, other=1e38).to(tl.float32)
+            v_hi = tl.where(in_b, v_lo, -1e38)
+            tmin = tl.minimum(tmin, tl.min(v_lo, axis=0))
+            tmax = tl.maximum(tmax, tl.max(v_hi, axis=0))
+        span = tl.maximum(tmax - tmin, 1e-6)
+        tl.store(out_q_ptr + b * 3 + 0, tmin + 0.25 * span)
+        tl.store(out_q_ptr + b * 3 + 1, tmin + 0.50 * span)
+        tl.store(out_q_ptr + b * 3 + 2, tmin + 0.75 * span)
+
+    @triton.jit
+    def _bucket4_count_kernel(
+        t_ptr,
+        q_ptr,
+        tile_cnt_ptr,
+        seg_starts_ptr,
+        seg_ends_ptr,
+        B,
+        N,
+        num_tiles,
+        STRICT_LT: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        b = tl.program_id(0)
+        base = b * N
+        q0 = tl.load(q_ptr + b * 3 + 0).to(tl.float32)
+        q1 = tl.load(q_ptr + b * 3 + 1).to(tl.float32)
+        q2 = tl.load(q_ptr + b * 3 + 2).to(tl.float32)
+        c0 = 0
+        c1 = 0
+        c2 = 0
+        c3 = 0
+        for tile in range(num_tiles):
+            offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+            in_b = offs < N
+            tv = tl.load(t_ptr + base + offs, mask=in_b, other=0.0).to(tl.float32)
+            if STRICT_LT:
+                b0 = in_b & (tv < q0)
+                b1 = in_b & (tv >= q0) & (tv < q1)
+                b2 = in_b & (tv >= q1) & (tv < q2)
+                b3 = in_b & (tv >= q2)
+            else:
+                b0 = in_b & (tv <= q0)
+                b1 = in_b & (tv > q0) & (tv <= q1)
+                b2 = in_b & (tv > q1) & (tv <= q2)
+                b3 = in_b & (tv > q2)
+            tb = (b * num_tiles + tile) * 4
+            tl.store(tile_cnt_ptr + tb + 0, c0)
+            tl.store(tile_cnt_ptr + tb + 1, c1)
+            tl.store(tile_cnt_ptr + tb + 2, c2)
+            tl.store(tile_cnt_ptr + tb + 3, c3)
+            c0 += tl.sum(b0.to(tl.int32), axis=0)
+            c1 += tl.sum(b1.to(tl.int32), axis=0)
+            c2 += tl.sum(b2.to(tl.int32), axis=0)
+            c3 += tl.sum(b3.to(tl.int32), axis=0)
+        o1 = c0
+        o2 = o1 + c1
+        o3 = o2 + c2
+        sb = b * 6
+        tl.store(seg_starts_ptr + sb + 0, 0)
+        tl.store(seg_ends_ptr + sb + 0, o2)
+        tl.store(seg_starts_ptr + sb + 1, o2)
+        tl.store(seg_ends_ptr + sb + 1, N)
+        tl.store(seg_starts_ptr + sb + 2, 0)
+        tl.store(seg_ends_ptr + sb + 2, o1)
+        tl.store(seg_starts_ptr + sb + 3, o1)
+        tl.store(seg_ends_ptr + sb + 3, o2)
+        tl.store(seg_starts_ptr + sb + 4, o2)
+        tl.store(seg_ends_ptr + sb + 4, o3)
+        tl.store(seg_starts_ptr + sb + 5, o3)
+        tl.store(seg_ends_ptr + sb + 5, N)
+
+    @triton.jit
+    def _bucket4_scatter_kernel(
+        p_ptr,
+        t_ptr,
+        q_ptr,
+        tile_cnt_ptr,
+        seg_starts_ptr,
+        out_p_ptr,
+        out_t_ptr,
+        out_idx_ptr,
+        B,
+        N,
+        num_tiles,
+        STRICT_LT: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        b = tl.program_id(0)
+        tile = tl.program_id(1)
+        base = b * N
+        offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+        in_b = offs < N
+
+        q0 = tl.load(q_ptr + b * 3 + 0).to(tl.float32)
+        q1 = tl.load(q_ptr + b * 3 + 1).to(tl.float32)
+        q2 = tl.load(q_ptr + b * 3 + 2).to(tl.float32)
+
+        tv = tl.load(t_ptr + base + offs, mask=in_b, other=0.0).to(tl.float32)
+        pv = tl.load(p_ptr + base + offs, mask=in_b, other=0.0).to(tl.float32)
+
+        if STRICT_LT:
+            b0 = in_b & (tv < q0)
+            b1 = in_b & (tv >= q0) & (tv < q1)
+            b2 = in_b & (tv >= q1) & (tv < q2)
+            b3 = in_b & (tv >= q2)
+        else:
+            b0 = in_b & (tv <= q0)
+            b1 = in_b & (tv > q0) & (tv <= q1)
+            b2 = in_b & (tv > q1) & (tv <= q2)
+            b3 = in_b & (tv > q2)
+
+        tb = (b * num_tiles + tile) * 4
+        sb = b * 6
+        off0 = tl.load(seg_starts_ptr + sb + 2) + tl.load(tile_cnt_ptr + tb + 0)
+        off1 = tl.load(seg_starts_ptr + sb + 3) + tl.load(tile_cnt_ptr + tb + 1)
+        off2 = tl.load(seg_starts_ptr + sb + 4) + tl.load(tile_cnt_ptr + tb + 2)
+        off3 = tl.load(seg_starts_ptr + sb + 5) + tl.load(tile_cnt_ptr + tb + 3)
+
+        pos0 = off0 + tl.cumsum(b0.to(tl.int32), axis=0) - 1
+        pos1 = off1 + tl.cumsum(b1.to(tl.int32), axis=0) - 1
+        pos2 = off2 + tl.cumsum(b2.to(tl.int32), axis=0) - 1
+        pos3 = off3 + tl.cumsum(b3.to(tl.int32), axis=0) - 1
+
+        dst = tl.where(b0, pos0, tl.where(b1, pos1, tl.where(b2, pos2, pos3)))
+        tl.store(out_p_ptr + base + dst, pv.to(out_p_ptr.dtype.element_ty), mask=in_b)
+        tl.store(out_t_ptr + base + dst, tv, mask=in_b)
+        tl.store(out_idx_ptr + base + dst, offs, mask=in_b)
+
+    @triton.jit
+    def _seg_t_med_kernel(
+        t_part_ptr,
+        starts_ptr,
+        ends_ptr,
+        out_t_med_ptr,
+        B,
+        N,
+        G,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Exact segment median on partitioned (unsorted within bucket) target slices."""
+        b = tl.program_id(0)
+        g = tl.program_id(1)
+        bg = b * G + g
+        seg_start = tl.load(starts_ptr + bg)
+        seg_end = tl.load(ends_ptr + bg)
+        cnt = seg_end - seg_start
+        if cnt <= 0:
+            tl.store(out_t_med_ptr + bg, 0.0)
+            return
+
+        base = b * N
+        k_rem = (cnt - 1) // 2
+        prefix = tl.zeros((), dtype=tl.uint32)
+        mp = tl.zeros((), dtype=tl.uint32)
+        idx_256 = tl.arange(0, 256)
+        keep_lo = (1 - tl.arange(0, 2))[:, None]
+
+        for pass_i in tl.static_range(4):
+            shift = 24 - 8 * pass_i
+            hist = tl.zeros([256], dtype=tl.int32)
+            for start in range(seg_start, seg_end, BLOCK_N):
+                offs = start + tl.arange(0, BLOCK_N)
+                in_s = offs < seg_end
+                val = tl.load(t_part_ptr + base + offs, mask=in_s, other=0.0).to(tl.float32)
+                val = tl.where(val == 0.0, 0.0, val)
+                u = val.to(tl.uint32, bitcast=True)
+                key = u ^ tl.where(
+                    (u >> 31) != 0,
+                    tl.full([BLOCK_N], 0xFFFFFFFF, tl.uint32),
+                    tl.full([BLOCK_N], 0x80000000, tl.uint32),
+                )
+                match = in_s if pass_i == 0 else (in_s & ((key & mp) == prefix))
+                bv = tl.where(match, ((key >> shift) & 0xFF).to(tl.int32), 256)
+                hist += tl.sum(tl.reshape(tl.histogram(bv, 512), [2, 256]) * keep_lo, axis=0)
+            csum = tl.cumsum(hist, axis=0)
+            bk = tl.argmax((csum > k_rem).to(tl.int32), axis=0)
+            k_rem -= tl.sum(tl.where(idx_256 == (bk - 1), csum, 0), axis=0)
+            prefix |= bk.to(tl.uint32) << shift
+            mp |= tl.full((), 0xFF, tl.uint32) << shift
+
+        inv_u = prefix ^ tl.where((prefix >> 31) == 0, tl.full((), 0xFFFFFFFF, tl.uint32), tl.full((), 0x80000000, tl.uint32))
+        tl.store(out_t_med_ptr + bg, inv_u.to(tl.float32, bitcast=True))
+
+    @triton.jit
+    def _bucket_bwd_scatter_kernel(
+        p_part_ptr,
+        t_part_ptr,
+        orig_idx_ptr,
+        grad_p_ptr,
+        starts_ptr,
+        ends_ptr,
+        p_med_ptr,
+        t_med_ptr,
+        p_mad_ptr,
+        t_mad_ptr,
+        non_flat_ptr,
+        counts_ptr,
+        p_med_idx_ptr,
+        sum_s_ptr,
+        sum_sp_ptr,
+        sum_signp_ptr,
+        grad_out_ptr,
+        denom_ptr,
+        B,
+        N,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Fused S=2 + S=4 backward with in-register median scatter and direct pred-dtype output."""
+        b = tl.program_id(0)
+        k = tl.program_id(1)
+        g4 = 2 + k
+        g2 = k // 2
+        bg4 = b * 6 + g4
+        bg2 = b * 6 + g2
+
+        seg_start = tl.load(starts_ptr + bg4)
+        seg_end = tl.load(ends_ptr + bg4)
+        if seg_end <= seg_start:
+            return
+
+        nf4 = tl.load(non_flat_ptr + bg4).to(tl.float32) > 0.5
+        nf2 = tl.load(non_flat_ptr + bg2).to(tl.float32) > 0.5
+        base = b * N
+
+        if (not nf4) & (not nf2):
+            zero_vec = tl.zeros([BLOCK_N], dtype=grad_p_ptr.dtype.element_ty)
+            for start in range(seg_start, seg_end, BLOCK_N):
+                offs = start + tl.arange(0, BLOCK_N)
+                in_s = offs < seg_end
+                oidx = tl.load(orig_idx_ptr + base + offs, mask=in_s, other=0)
+                tl.store(grad_p_ptr + base + oidx, zero_vec, mask=in_s)
+            return
+
+        scale = tl.load(grad_out_ptr).to(tl.float32) / tl.load(denom_ptr).to(tl.float32)
+
+        pm4 = tl.load(p_med_ptr + bg4).to(tl.float32)
+        tm4 = tl.load(t_med_ptr + bg4).to(tl.float32)
+        pmad4 = tl.load(p_mad_ptr + bg4).to(tl.float32)
+        ps4 = tl.maximum(pmad4, 1e-6)
+        ts4 = tl.maximum(tl.load(t_mad_ptr + bg4).to(tl.float32), 1e-6)
+        cnt4 = tl.maximum(tl.load(counts_ptr + bg4).to(tl.float32), 1.0)
+        ssp4 = tl.load(sum_sp_ptr + bg4).to(tl.float32)
+        ss4 = tl.load(sum_s_ptr + bg4).to(tl.float32)
+        sgnp4 = tl.load(sum_signp_ptr + bg4).to(tl.float32)
+        mc4 = (ssp4 / cnt4) if (pmad4 >= 1e-6) else 0.0
+        gmed4 = (scale * (-ss4 + mc4 * sgnp4) / ps4) if nf4 else 0.0
+        mid4 = tl.load(p_med_idx_ptr + bg4)
+
+        pm2 = tl.load(p_med_ptr + bg2).to(tl.float32)
+        tm2 = tl.load(t_med_ptr + bg2).to(tl.float32)
+        pmad2 = tl.load(p_mad_ptr + bg2).to(tl.float32)
+        ps2 = tl.maximum(pmad2, 1e-6)
+        ts2 = tl.maximum(tl.load(t_mad_ptr + bg2).to(tl.float32), 1e-6)
+        cnt2 = tl.maximum(tl.load(counts_ptr + bg2).to(tl.float32), 1.0)
+        ssp2 = tl.load(sum_sp_ptr + bg2).to(tl.float32)
+        ss2 = tl.load(sum_s_ptr + bg2).to(tl.float32)
+        sgnp2 = tl.load(sum_signp_ptr + bg2).to(tl.float32)
+        mc2 = (ssp2 / cnt2) if (pmad2 >= 1e-6) else 0.0
+        gmed2 = (scale * (-ss2 + mc2 * sgnp2) / ps2) if nf2 else 0.0
+        mid2 = tl.load(p_med_idx_ptr + bg2)
+
+        for start in range(seg_start, seg_end, BLOCK_N):
+            offs = start + tl.arange(0, BLOCK_N)
+            in_s = offs < seg_end
+            pv = tl.load(p_part_ptr + base + offs, mask=in_s, other=0.0).to(tl.float32)
+            tv = tl.load(t_part_ptr + base + offs, mask=in_s, other=0.0).to(tl.float32)
+            oidx = tl.load(orig_idx_ptr + base + offs, mask=in_s, other=0)
+
+            gp = tl.zeros([BLOCK_N], dtype=tl.float32)
+            if nf4:
+                dp4 = pv - pm4
+                err4 = dp4 / ps4 - (tv - tm4) / ts4
+                s4 = tl.where(err4 > 0.0, 1.0, tl.where(err4 < 0.0, -1.0, 0.0))
+                sd4 = tl.where(dp4 > 0.0, 1.0, tl.where(dp4 < 0.0, -1.0, 0.0))
+                gp += scale * (s4 - mc4 * sd4) / ps4 + tl.where(offs == mid4, gmed4, 0.0)
+            if nf2:
+                dp2 = pv - pm2
+                err2 = dp2 / ps2 - (tv - tm2) / ts2
+                s2 = tl.where(err2 > 0.0, 1.0, tl.where(err2 < 0.0, -1.0, 0.0))
+                sd2 = tl.where(dp2 > 0.0, 1.0, tl.where(dp2 < 0.0, -1.0, 0.0))
+                gp += scale * (s2 - mc2 * sd2) / ps2 + tl.where(offs == mid2, gmed2, 0.0)
+
+            tl.store(grad_p_ptr + base + oidx, gp.to(grad_p_ptr.dtype.element_ty), mask=in_s)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,26 +1588,22 @@ class _TritonNormalize(torch.autograd.Function):
             g1_p, g2_p, gs_p, B, N, num_tiles,
             HAS_MASK=ctx.has_mask, BLOCK_N=ctx.block_med,
         )
-        g1 = g1_p.sum(dim=1)
-        g2 = g2_p.sum(dim=1)
-        gs = gs_p.sum(dim=1)
 
-        mad_clamped = (p_mad < 1e-6).to(torch.float32)
-        grad_p = torch.empty((B, N), device=device, dtype=torch.float32)
-        _norm_bwd_write_kernel[(B, triton.cdiv(N, ctx.block_apply))](
-            p_flat, m_flat, dp_flat, grad_p,
-            p_med, p_mad, mad_clamped, g2, M,
-            B, N, HAS_MASK=ctx.has_mask, BLOCK_N=ctx.block_apply,
+        coeff = torch.empty(B, device=device, dtype=torch.float32)
+        gmed = torch.empty(B, device=device, dtype=torch.float32)
+        ps = torch.empty(B, device=device, dtype=torch.float32)
+        _norm_bwd_reduce_kernel[(B,)](
+            g1_p, g2_p, gs_p, p_mad, M,
+            coeff, gmed, ps, B, num_tiles,
         )
 
-        p_mad_safe = p_mad.clamp(min=1e-6)
-        not_clamped = mad_clamped == 0.0
-        g_med = (-g1 + torch.where(not_clamped, gs * (g2 / p_mad_safe) / M, 0.0)) / p_mad_safe
-        valid_med = (p_idx >= 0) & (p_idx < N)
-        idx_safe = torch.where(valid_med, p_idx, 0).unsqueeze(1)
-        g_med_safe = torch.where(valid_med, g_med, 0.0).unsqueeze(1)
-        grad_p.scatter_add_(1, idx_safe, g_med_safe)
-        return grad_p.view(d_phat.shape).to(ctx.pred_dtype), None, None, None, None
+        grad_p = torch.empty((B, N), device=device, dtype=ctx.pred_dtype)
+        _norm_bwd_write_kernel[(B, triton.cdiv(N, ctx.block_apply))](
+            p_flat, m_flat, dp_flat, grad_p,
+            p_med, p_idx, coeff, gmed, ps,
+            B, N, HAS_MASK=ctx.has_mask, BLOCK_N=ctx.block_apply,
+        )
+        return grad_p.view(d_phat.shape), None, None, None, None
 
 
 class _TritonSSI(torch.autograd.Function):
@@ -1221,7 +1728,7 @@ class _SortedTritonHDN(torch.autograd.Function):
         _sorted_seg_stats_kernel[(B, G_total)](
             p_sorted, t_sorted, m_sorted, starts, ends,
             p_med, t_med, p_mad, t_mad, counts, p_med_idx,
-            B, N, G_total, HAS_MASK=has_mask, BLOCK_N=block_n,
+            B, N, G_total, HAS_MASK=has_mask, PRE_TMED=False, BLOCK_N=block_n,
         )
 
         non_flat = ((t_mad > 1e-5) & (counts > 16.0)).to(torch.float32)
@@ -1363,16 +1870,248 @@ class _TritonGradNormalScale(torch.autograd.Function):
         grad_p = torch.empty_like(p, dtype=torch.float32)
         grid = (B * H * triton.cdiv(W, ctx.BLOCK_W),)
         _grad_norm_bwd_kernel[grid](
-            p, t, m_buf, grad_p,
+            p, t, m_buf, grad_p, grad_p,
             w_grad, w_norm,
-            B, H, W,
+            B, H, W, 0, 0,
             p.stride(0), p.stride(1), p.stride(2),
             ctx.normal_beta,
             HAS_MASK=ctx.has_mask,
             COMPUTE_NORMAL=ctx.compute_normal,
+            ADD_UP=False,
             BLOCK_W=ctx.BLOCK_W,
         )
         return grad_p.to(ctx.pred_dtype), None, None, None, None
+
+
+class _BucketTritonHDN(torch.autograd.Function):
+    """Sort-free 4-bucket contiguous HDN for dense (2, 4) segments."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        q3: torch.Tensor,
+        strict_lt: bool,
+    ) -> torch.Tensor:
+        B, H, W = pred.shape
+        N = H * W
+        device = pred.device
+        p_flat = pred.contiguous().view(B, N)
+        t_flat = target.contiguous().view(B, N)
+
+        block_n = 2048 if N > 512 else 512
+        num_tiles = triton.cdiv(N, block_n)
+        tile_cnt = torch.empty((B, num_tiles, 4), device=device, dtype=torch.int32)
+        starts = torch.empty((B, 6), device=device, dtype=torch.int32)
+        ends = torch.empty((B, 6), device=device, dtype=torch.int32)
+        _bucket4_count_kernel[(B,)](
+            t_flat, q3, tile_cnt, starts, ends,
+            B, N, num_tiles, STRICT_LT=strict_lt, BLOCK_N=block_n,
+        )
+
+        p_part = torch.empty((B, N), device=device, dtype=pred.dtype)
+        t_part = torch.empty((B, N), device=device, dtype=torch.float32)
+        orig_idx = torch.empty((B, N), device=device, dtype=torch.int32)
+        _bucket4_scatter_kernel[(B, num_tiles)](
+            p_flat, t_flat, q3, tile_cnt, starts,
+            p_part, t_part, orig_idx,
+            B, N, num_tiles, STRICT_LT=strict_lt, BLOCK_N=block_n,
+        )
+
+        t_med = torch.empty((B, 6), device=device, dtype=torch.float32)
+        _seg_t_med_kernel[(B, 6)](t_part, starts, ends, t_med, B, N, 6, BLOCK_N=block_n)
+
+        p_med = torch.empty((B, 6), device=device, dtype=torch.float32)
+        p_mad = torch.empty((B, 6), device=device, dtype=torch.float32)
+        t_mad = torch.empty((B, 6), device=device, dtype=torch.float32)
+        counts = torch.empty((B, 6), device=device, dtype=torch.float32)
+        p_med_idx = torch.empty((B, 6), device=device, dtype=torch.int32)
+        _sorted_seg_stats_kernel[(B, 6)](
+            p_part, t_part, p_part, starts, ends,
+            p_med, t_med, p_mad, t_mad, counts, p_med_idx,
+            B, N, 6, HAS_MASK=False, PRE_TMED=True, BLOCK_N=block_n,
+        )
+
+        non_flat = ((t_mad > 1e-5) & (counts > 16.0)).to(torch.float32)
+        denom = (counts * non_flat).sum() + 1e-8
+
+        out_loss = torch.empty((B, 6), device=device, dtype=torch.float32)
+        sum_s = torch.empty((B, 6), device=device, dtype=torch.float32)
+        sum_sp = torch.empty((B, 6), device=device, dtype=torch.float32)
+        sum_signp = torch.empty((B, 6), device=device, dtype=torch.float32)
+        _sorted_seg_fwd_kernel[(B, 6)](
+            p_part, t_part, p_part, starts, ends,
+            p_med, t_med, p_mad, t_mad, non_flat,
+            out_loss, sum_s, sum_sp, sum_signp,
+            B, N, 6, HAS_MASK=False, BLOCK_N=block_n,
+        )
+        loss = out_loss.sum() / denom
+
+        ctx.save_for_backward(
+            p_part, t_part, orig_idx, starts, ends,
+            p_med, t_med, p_mad, t_mad, non_flat, counts,
+            p_med_idx, sum_s, sum_sp, sum_signp, denom,
+        )
+        ctx.block_n = block_n
+        ctx.shape = pred.shape
+        ctx.dtype = pred.dtype
+        return loss
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_out: torch.Tensor,
+    ) -> Tuple[torch.Tensor, None, None, None]:
+        (
+            p_part, t_part, orig_idx, starts, ends,
+            p_med, t_med, p_mad, t_mad, non_flat, counts,
+            p_med_idx, sum_s, sum_sp, sum_signp, denom,
+        ) = ctx.saved_tensors
+        B, N = t_part.shape
+        grad_p = torch.empty((B, N), device=p_part.device, dtype=ctx.dtype)
+        _bucket_bwd_scatter_kernel[(B, 4)](
+            p_part, t_part, orig_idx, grad_p,
+            starts, ends,
+            p_med, t_med, p_mad, t_mad,
+            non_flat, counts, p_med_idx,
+            sum_s, sum_sp, sum_signp,
+            grad_out.contiguous().view(1), denom.view(1),
+            B, N, BLOCK_N=ctx.block_n,
+        )
+        return grad_p.view(ctx.shape), None, None, None
+
+
+class _TritonMultiScaleGradNormal(torch.autograd.Function):
+    """Fused multi-scale gradient + normal loss skipping avg_pool2d_backward."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        p_hat: torch.Tensor,
+        t_hat: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        grad_scales: int,
+        normal_beta: float,
+        compute_normal: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = p_hat.shape[0]
+        device = p_hat.device
+        has_mask = mask is not None
+
+        p_curr = p_hat.contiguous().float()
+        t_curr = t_hat.contiguous().float()
+        m_curr = mask.contiguous().float() if has_mask else p_curr
+
+        ps = [p_curr]
+        ts = [t_curr]
+        ms = [m_curr]
+        for _ in range(1, grad_scales):
+            _, h_i, w_i = ps[-1].shape
+            if h_i < 2 or w_i < 2:
+                break
+            h_o, w_o = h_i // 2, w_i // 2
+            p_next = torch.empty((B, h_o, w_o), device=device, dtype=torch.float32)
+            t_next = torch.empty((B, h_o, w_o), device=device, dtype=torch.float32)
+            m_next = torch.empty((B, h_o, w_o), device=device, dtype=torch.float32) if has_mask else p_next
+            bx = 128 if w_o >= 128 else (64 if w_o >= 64 else 32)
+            _pool2x_pair_kernel[(B * h_o * triton.cdiv(w_o, bx),)](
+                ps[-1], ts[-1], ms[-1], p_next, t_next, m_next,
+                B, h_i, w_i, h_o, w_o, HAS_MASK=has_mask, BLOCK_X=bx,
+            )
+            ps.append(p_next)
+            ts.append(t_next)
+            ms.append(m_next)
+
+        actual_scales = len(ps)
+        bws = []
+        denom_grads = []
+        denom_norms = []
+        grad_terms = []
+        norm_terms = []
+
+        for s in range(actual_scales):
+            pi, ti, mi = ps[s], ts[s], ms[s]
+            _, hs, ws = pi.shape
+            bw = 256 if ws >= 128 else (128 if ws >= 64 else (64 if ws >= 32 else 32))
+            bws.append(bw)
+            grid = (B * hs * triton.cdiv(ws, bw),)
+            out_g = torch.empty(grid[0], device=device, dtype=torch.float32)
+            out_n = torch.empty(grid[0], device=device, dtype=torch.float32) if compute_normal else out_g
+            out_dmg = torch.empty(grid[0], device=device, dtype=torch.float32) if has_mask else out_g
+            out_dmn = torch.empty(grid[0], device=device, dtype=torch.float32) if (has_mask and compute_normal) else out_g
+
+            _grad_norm_fwd_kernel[grid](
+                pi, ti, mi, out_g, out_n, out_dmg, out_dmn,
+                B, hs, ws, pi.stride(0), pi.stride(1), pi.stride(2),
+                float(normal_beta), HAS_MASK=has_mask, COMPUTE_NORMAL=compute_normal, BLOCK_W=bw,
+            )
+            if has_mask:
+                dg = out_dmg.sum() + 1e-8
+                dn = (out_dmn.sum() + 1e-8) if compute_normal else out_g.new_ones(())
+            else:
+                dg = out_g.new_full((), float(B * (hs * max(ws - 1, 0) + max(hs - 1, 0) * ws)) + 1e-8)
+                dn = out_g.new_full((), float(B * max(hs - 1, 0) * max(ws - 1, 0)) + 1e-8) if compute_normal else out_g.new_ones(())
+            denom_grads.append(dg)
+            denom_norms.append(dn)
+            grad_terms.append(out_g.sum() / dg)
+            if compute_normal:
+                norm_terms.append(out_n.sum() / dn)
+
+        grad_total = torch.stack(grad_terms).sum() / actual_scales
+        norm_total = (torch.stack(norm_terms).sum() / actual_scales) if compute_normal else p_hat.new_zeros((), dtype=torch.float32)
+
+        ctx.save_for_backward(*ps, *ts, *ms, *denom_grads, *denom_norms)
+        ctx.actual_scales = actual_scales
+        ctx.bws = bws
+        ctx.has_mask = has_mask
+        ctx.compute_normal = compute_normal
+        ctx.normal_beta = float(normal_beta)
+        ctx.pred_dtype = p_hat.dtype
+        return grad_total, norm_total
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        d_grad: torch.Tensor,
+        d_norm: torch.Tensor,
+    ) -> Tuple[torch.Tensor, None, None, None, None, None]:
+        S = ctx.actual_scales
+        saved = ctx.saved_tensors
+        ps = saved[0:S]
+        ts = saved[S:2 * S]
+        ms = saved[2 * S:3 * S]
+        denom_grads = saved[3 * S:4 * S]
+        denom_norms = saved[4 * S:5 * S]
+
+        B = ps[0].shape[0]
+        dg_f = d_grad.to(torch.float32) / float(S)
+        dn_f = d_norm.to(torch.float32) / float(S)
+
+        grad_up: Optional[torch.Tensor] = None
+        for s in range(S - 1, -1, -1):
+            pi, ti, mi = ps[s], ts[s], ms[s]
+            _, hs, ws = pi.shape
+            bw = ctx.bws[s]
+            wg = (dg_f / denom_grads[s]).view(1)
+            wn = (dn_f / denom_norms[s]).view(1) if ctx.compute_normal else wg
+            gp = torch.empty((B, hs, ws), device=pi.device, dtype=torch.float32)
+            h_up, w_up = (grad_up.shape[1], grad_up.shape[2]) if grad_up is not None else (0, 0)
+            _grad_norm_bwd_kernel[(B * hs * triton.cdiv(ws, bw),)](
+                pi, ti, mi, grad_up if grad_up is not None else gp, gp,
+                wg, wn,
+                B, hs, ws, h_up, w_up,
+                pi.stride(0), pi.stride(1), pi.stride(2),
+                ctx.normal_beta,
+                HAS_MASK=ctx.has_mask,
+                COMPUTE_NORMAL=ctx.compute_normal,
+                ADD_UP=(grad_up is not None),
+                BLOCK_W=bw,
+            )
+            grad_up = gp
+
+        assert grad_up is not None
+        return grad_up.to(ctx.pred_dtype), None, None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -1540,6 +2279,29 @@ def compute_hdn_sort_plan(
     return t_sorted, t_order, t_med_global, st, en, t_med_seg
 
 
+def compute_hdn_thresholds(
+    target_flat: torch.Tensor,
+    mode: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute global target median and 4-bin HDN thresholds (dp/dr) without sorting."""
+    B, N = target_flat.shape
+    t_flat = target_flat.contiguous().float()
+    q3 = torch.empty((B, 3), device=target_flat.device, dtype=torch.float32)
+    block_n = 2048 if N > 512 else 512
+    if mode == "dp":
+        k0 = (N - 1) // 4
+        k1 = (N - 1) // 2
+        k2 = (3 * (N - 1)) // 4
+        _q3_packed1024_kernel[(B,)](t_flat, q3, B, N, k0, k1, k2, BLOCK_N=block_n)
+        t_med = q3[:, 1].contiguous()
+    else:
+        _dr_bounds_kernel[(B,)](t_flat, q3, B, N, BLOCK_N=block_n)
+        t_med = torch.empty(B, device=target_flat.device, dtype=torch.float32)
+        p_dummy = torch.empty(B, device=target_flat.device, dtype=torch.int64)
+        _dense_median_kernel[(B,)](t_flat, t_med, p_dummy, B, N, FIND_IDX=False, BLOCK_N=block_n)
+    return t_med, q3
+
+
 def hdn_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -1547,8 +2309,9 @@ def hdn_loss(
     segments: Sequence[int] = (2, 4),
     mode: str = "dp",
     sort_plan: Optional[Tuple[torch.Tensor, ...]] = None,
+    bucket_q3: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Multi-level Hybrid Depth Normalization loss with optional precomputed sort_plan."""
+    """Multi-level Hybrid Depth Normalization loss with optional precomputed plan/thresholds."""
     if not segments:
         return pred.new_zeros((), dtype=torch.float32)
     if mask is not None and not mask.is_floating_point():
@@ -1558,6 +2321,10 @@ def hdn_loss(
     N = H * W
 
     if can_use_triton(pred):
+        if mask is None and tuple(segments) == (2, 4) and sort_plan is None and N >= 64:
+            if bucket_q3 is None:
+                _, bucket_q3 = compute_hdn_thresholds(target.contiguous().view(B, N), mode)
+            return _BucketTritonHDN.apply(pred, target, bucket_q3, (mode == "dr"))
         if sort_plan is None:
             sort_plan = compute_hdn_sort_plan(target.contiguous().view(B, N), segments, mode)
         t_sorted, t_order, _, starts, ends, t_med_dense = sort_plan
@@ -1625,6 +2392,12 @@ def grad_normal_loss(
     compute_normal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Multi-scale gradient L1 and optional intrinsics-free virtual surface normal cosine loss."""
+    if can_use_triton(p_hat) and grad_scales >= 1 and (mask is None or grad_scales <= 4):
+        m_in = (mask if mask.is_floating_point() else mask.float()) if mask is not None else None
+        return _TritonMultiScaleGradNormal.apply(
+            p_hat, t_hat, m_in, int(grad_scales), float(normal_beta), bool(compute_normal)
+        )
+
     total_grad = p_hat.new_zeros((), dtype=torch.float32)
     total_norm = p_hat.new_zeros((), dtype=torch.float32)
     use_triton = can_use_triton(p_hat)

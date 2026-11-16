@@ -14,7 +14,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from zipdepth.loss._triton_ops import (
+    can_use_triton,
     compute_hdn_sort_plan,
+    compute_hdn_thresholds,
     grad_normal_loss,
     hdn_loss as fast_hdn_loss,
     normalize_depth,
@@ -72,18 +74,25 @@ class HDNDistillationLoss(nn.Module):
 
         use_hdn = self.alpha["hdn"] > 0 and len(self.hdn_segments) > 0
         sort_plan: Optional[Tuple[torch.Tensor, ...]] = None
+        bucket_q3: Optional[torch.Tensor] = None
         t_med_pre: Optional[torch.Tensor] = None
 
-        # Pre-sort target once per batch to share t_med and HDN slice boundaries
+        # Precompute shared target thresholds (sort-free for dense (2,4) on CUDA)
         if use_hdn:
             B, H, W = target.shape
-            sort_plan = compute_hdn_sort_plan(
-                target.contiguous().view(B, H * W),
-                self.hdn_segments,
-                self.hdn_mode,
-            )
-            if dense_mode:
-                t_med_pre = sort_plan[2]
+            if dense_mode and self.hdn_segments == (2, 4) and can_use_triton(target) and (H * W) >= 64:
+                t_med_pre, bucket_q3 = compute_hdn_thresholds(
+                    target.contiguous().view(B, H * W),
+                    self.hdn_mode,
+                )
+            else:
+                sort_plan = compute_hdn_sort_plan(
+                    target.contiguous().view(B, H * W),
+                    self.hdn_segments,
+                    self.hdn_mode,
+                )
+                if dense_mode:
+                    t_med_pre = sort_plan[2]
 
         # 1. Global Normalization (S = 1 context)
         p_hat, t_hat = normalize_depth(
@@ -111,6 +120,7 @@ class HDNDistillationLoss(nn.Module):
                 segments=self.hdn_segments,
                 mode=self.hdn_mode,
                 sort_plan=sort_plan,
+                bucket_q3=bucket_q3,
             )
         else:
             hdn_loss = pred.new_zeros((), dtype=torch.float32)
