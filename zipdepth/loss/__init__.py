@@ -1,8 +1,12 @@
+from typing import Any
+
+import torch.nn as nn
+
 from zipdepth.loss.depth_loss import ZipDepthLoss
 from zipdepth.loss.hdn_loss import HDNDistillationLoss
 
 
-def create_loss(loss_type="original", **kwargs):
+def create_loss(loss_type: str = "original", **kwargs: Any) -> nn.Module:
     """
     Factory to instantiate ZipDepth loss functions.
 

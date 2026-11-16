@@ -7,9 +7,19 @@ Integrates:
   3. Multi-Scale Gradient + 2D Disparity Surface Normal Cosine Loss
 """
 
+from typing import Dict, Optional, Sequence, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from zipdepth.loss._triton_ops import (
+    compute_hdn_sort_plan,
+    grad_normal_loss,
+    hdn_loss as fast_hdn_loss,
+    normalize_depth,
+    trimmed_ssi_loss,
+)
 
 
 class HDNDistillationLoss(nn.Module):
@@ -25,18 +35,18 @@ class HDNDistillationLoss(nn.Module):
 
     def __init__(
         self,
-        alpha_ssi=1.0,
-        alpha_hdn=1.0,
-        alpha_grad=2.0,
-        alpha_normal=0.5,
-        grad_scales=4,
-        trim_ratio=0.10,
-        hdn_segments=(2, 4),
-        hdn_mode="dp",
-        normal_beta=1.0,
-    ):
+        alpha_ssi: float = 1.0,
+        alpha_hdn: float = 1.0,
+        alpha_grad: float = 2.0,
+        alpha_normal: float = 0.5,
+        grad_scales: int = 4,
+        trim_ratio: float = 0.10,
+        hdn_segments: Sequence[int] = (2, 4),
+        hdn_mode: str = "dp",
+        normal_beta: float = 1.0,
+    ) -> None:
         super().__init__()
-        self.alpha = {
+        self.alpha: Dict[str, float] = {
             "ssi": float(alpha_ssi),
             "hdn": float(alpha_hdn),
             "grad": float(alpha_grad),
@@ -44,32 +54,68 @@ class HDNDistillationLoss(nn.Module):
         }
         self.grad_scales = int(grad_scales)
         self.trim_ratio = float(trim_ratio)
-        self.hdn_segments = tuple(int(s) for s in hdn_segments)
+        self.hdn_segments: Tuple[int, ...] = tuple(int(s) for s in hdn_segments)
         self.hdn_mode = str(hdn_mode).lower()
         self.normal_beta = float(normal_beta)
 
-    def forward(self, pred, target, mask=None):
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         pred, target = self._squeeze(pred, target)
         dense_mode = mask is None
-        if dense_mode:
-            mask = torch.ones_like(target, dtype=torch.float32)
-        else:
+        if not dense_mode:
             (mask,) = self._squeeze(mask)
-            mask = mask.float()
+            mask = mask if mask.is_floating_point() else mask.float()
+
+        use_hdn = self.alpha["hdn"] > 0 and len(self.hdn_segments) > 0
+        sort_plan: Optional[Tuple[torch.Tensor, ...]] = None
+        t_med_pre: Optional[torch.Tensor] = None
+
+        # Pre-sort target once per batch to share t_med and HDN slice boundaries
+        if use_hdn:
+            B, H, W = target.shape
+            sort_plan = compute_hdn_sort_plan(
+                target.contiguous().view(B, H * W),
+                self.hdn_segments,
+                self.hdn_mode,
+            )
+            if dense_mode:
+                t_med_pre = sort_plan[2]
 
         # 1. Global Normalization (S = 1 context)
-        p_hat, t_hat = self._normalize_global(pred, target, mask, dense_mode=dense_mode)
+        p_hat, t_hat = normalize_depth(
+            pred,
+            target,
+            mask=None if dense_mode else mask,
+            t_med_pre=t_med_pre,
+            mad_denom_eps=0.0,
+        )
 
-        # 2. Trimmed Global SSI Loss (rejects top 10% noisy pseudo-label outliers per image)
-        ssi_loss = self._trimmed_ssi_loss(p_hat, t_hat, mask, dense_mode=dense_mode)
+        # 2. Trimmed Global SSI Loss (rejects top trim_ratio noisy pseudo-label outliers per image)
+        ssi_loss = trimmed_ssi_loss(
+            p_hat,
+            t_hat,
+            mask=None if dense_mode else mask,
+            trim_ratio=self.trim_ratio,
+        )
 
-        # 3. Distill Any Depth Hybrid Normalization Loss (L_sc across S in {2, 4} depth segments)
-        if self.alpha["hdn"] > 0 and len(self.hdn_segments) > 0:
-            hdn_loss = self._hybrid_depth_norm_loss(pred, target, mask)
+        # 3. Distill Any Depth Hybrid Normalization Loss (L_sc across S depth segments)
+        if use_hdn:
+            hdn_loss = fast_hdn_loss(
+                pred,
+                target,
+                mask=None if dense_mode else mask,
+                segments=self.hdn_segments,
+                mode=self.hdn_mode,
+                sort_plan=sort_plan,
+            )
         else:
-            hdn_loss = torch.zeros_like(ssi_loss)
+            hdn_loss = pred.new_zeros((), dtype=torch.float32)
 
-        # 4. Multi-Scale Gradient + 2D Disparity Normal Loss (reuses p_dx, p_dy, t_dx, t_dy)
+        # 4. Multi-Scale Gradient + 2D Disparity Virtual Normal Loss
         grad_loss, normal_loss = self._gradient_and_normal_loss(p_hat, t_hat, mask)
 
         total = (
@@ -79,174 +125,91 @@ class HDNDistillationLoss(nn.Module):
             + self.alpha["normal"] * normal_loss
         )
 
+        ssi_v, hdn_v, grad_v, norm_v = torch.stack([
+            ssi_loss.detach(),
+            hdn_loss.detach(),
+            grad_loss.detach(),
+            normal_loss.detach(),
+        ]).tolist()
         return total, {
-            "ssi": ssi_loss.detach().item(),
-            "hdn": hdn_loss.detach().item(),
-            "grad": grad_loss.detach().item(),
-            "normal": normal_loss.detach().item(),
+            "ssi": ssi_v,
+            "hdn": hdn_v,
+            "grad": grad_v,
+            "normal": norm_v,
         }
 
     # ------------------------------------------------------------------
-    def _normalize_global(self, pred, target, mask, dense_mode=True):
-        B = pred.shape[0]
-        if dense_mode:
-            # Fast path for dense pseudo-labels: avoids .clone() and slow torch.nanmedian
-            p_med = torch.median(pred.view(B, -1), dim=1).values.view(B, 1, 1)
-            t_med = torch.median(target.view(B, -1), dim=1).values.view(B, 1, 1)
-            p_mad = (pred - p_med).abs().mean(dim=(1, 2), keepdim=True)
-            t_mad = (target - t_med).abs().mean(dim=(1, 2), keepdim=True)
-        else:
-            pred_nan = pred.masked_fill(mask < 0.5, float("nan"))
-            tgt_nan = target.masked_fill(mask < 0.5, float("nan"))
-            p_med = torch.nanmedian(pred_nan.view(B, -1), dim=1).values.view(B, 1, 1)
-            t_med = torch.nanmedian(tgt_nan.view(B, -1), dim=1).values.view(B, 1, 1)
-            M = mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
-            p_mad = ((pred - p_med).abs() * mask).sum(dim=(1, 2), keepdim=True) / M
-            t_mad = ((target - t_med).abs() * mask).sum(dim=(1, 2), keepdim=True) / M
+    def _normalize_global(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        dense_mode: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pred, target = self._squeeze(pred, target)
+        if dense_mode is None:
+            dense_mode = mask is None
+        if not dense_mode and mask is not None:
+            (mask,) = self._squeeze(mask)
+        eff_mask = None if dense_mode else mask
+        return normalize_depth(pred, target, mask=eff_mask, mad_denom_eps=0.0)
 
-        p_hat = (pred - p_med) / p_mad.clamp(min=1e-6)
-        t_hat = (target - t_med) / t_mad.clamp(min=1e-6)
-        return p_hat, t_hat
+    def _trimmed_ssi_loss(
+        self,
+        p_hat: torch.Tensor,
+        t_hat: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        dense_mode: Optional[bool] = None,
+    ) -> torch.Tensor:
+        p_hat, t_hat = self._squeeze(p_hat, t_hat)
+        if dense_mode is None:
+            dense_mode = mask is None
+        if not dense_mode and mask is not None:
+            (mask,) = self._squeeze(mask)
+        eff_mask = None if dense_mode else mask
+        return trimmed_ssi_loss(p_hat, t_hat, mask=eff_mask, trim_ratio=self.trim_ratio)
 
-    def _trimmed_ssi_loss(self, p_hat, t_hat, mask, dense_mode=True):
-        B = p_hat.shape[0]
-        diff = (p_hat - t_hat).abs()
-
-        if self.trim_ratio <= 0.0:
-            M = mask.sum() + 1e-8
-            return (diff * mask).sum() / M
-
-        if dense_mode:
-            flat_diff = diff.view(B, -1)
-            num_keep = int(flat_diff.shape[1] * (1.0 - self.trim_ratio))
-            # Keep the smallest (1 - trim_ratio) residuals per image via topk(largest=False)
-            kept_diff, _ = torch.topk(flat_diff, k=num_keep, dim=1, largest=False, sorted=False)
-            return kept_diff.mean()
-        else:
-            # Masked trimming fallback
-            diff_masked = diff.masked_fill(mask < 0.5, float("inf")).view(B, -1)
-            sorted_diff, _ = torch.sort(diff_masked, dim=1)
-            valid_counts = (mask.view(B, -1) >= 0.5).sum(dim=1)
-            keep_counts = (valid_counts.float() * (1.0 - self.trim_ratio)).long().clamp(min=1)
-            idx = torch.arange(diff_masked.shape[1], device=p_hat.device).unsqueeze(0)
-            keep_mask = (idx < keep_counts.unsqueeze(1)).float()
-            safe_diff = torch.where(torch.isfinite(sorted_diff), sorted_diff, torch.zeros_like(sorted_diff))
-            return (safe_diff * keep_mask).sum() / (keep_counts.sum().float() + 1e-8)
-
-    def _hybrid_depth_norm_loss(self, pred, target, mask):
+    def _hybrid_depth_norm_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Distill Any Depth (arXiv:2502.19204) / HDN (NeurIPS 2022) Shared-Context Normalization.
         Partitions the teacher's depth map `target` into S in {2, 4} depth segments and normalizes
         pred and target independently within each depth segment.
         """
-        B, H, W = target.shape
-        t_flat = target.view(B, -1)
-        seg_masks = []
+        pred, target = self._squeeze(pred, target)
+        if mask is not None:
+            (mask,) = self._squeeze(mask)
+        return fast_hdn_loss(
+            pred,
+            target,
+            mask=mask,
+            segments=self.hdn_segments,
+            mode=self.hdn_mode,
+        )
 
-        if self.hdn_mode == "dp":
-            # Depth Percentile (Quantile) mode: guarantees balanced pixel counts per segment
-            for S in self.hdn_segments:
-                q_probs = torch.linspace(0.0, 1.0, steps=S + 1, device=target.device, dtype=target.dtype)
-                # quantiles shape: [S + 1, B, 1, 1]
-                q_vals = torch.quantile(t_flat, q_probs, dim=1).view(S + 1, B, 1, 1)
-                for s in range(S):
-                    low, high = q_vals[s], q_vals[s + 1]
-                    if s == 0:
-                        m_u = (target >= low) & (target <= high)
-                    else:
-                        m_u = (target > low) & (target <= high)
-                    seg_masks.append(m_u.float() * mask)
-        else:
-            # Depth Range (HDN-DR) mode: uniform intervals between [t_min, t_max]
-            t_min = t_flat.min(dim=1).values.view(B, 1, 1)
-            t_max = t_flat.max(dim=1).values.view(B, 1, 1)
-            t_span = (t_max - t_min).clamp(min=1e-6)
-            for S in self.hdn_segments:
-                step = t_span / S
-                for s in range(S):
-                    low = t_min + s * step
-                    high = t_min + (s + 1) * step
-                    if s == S - 1:
-                        m_u = (target >= low) & (target <= high + 1e-5)
-                    else:
-                        m_u = (target >= low) & (target < high)
-                    seg_masks.append(m_u.float() * mask)
-
-        # Stack all G segment masks: [B, G, H*W]
-        M_u = torch.stack(seg_masks, dim=1).view(B, -1, H * W)
-        G = M_u.shape[1]
-        p_exp = pred.view(B, 1, H * W).expand(B, G, H * W)
-        t_exp = target.view(B, 1, H * W).expand(B, G, H * W)
-
-        # Compute masked median per (Batch, Segment)
-        p_nan = p_exp.masked_fill(M_u < 0.5, float("nan"))
-        t_nan = t_exp.masked_fill(M_u < 0.5, float("nan"))
-        p_med = torch.nanmedian(p_nan, dim=2, keepdim=True).values.nan_to_num(0.0)
-        t_med = torch.nanmedian(t_nan, dim=2, keepdim=True).values.nan_to_num(0.0)
-
-        counts = M_u.sum(dim=2, keepdim=True)
-        valid_group = (counts > 16.0).float()  # Ignore degenerate empty segments
-        safe_counts = counts.clamp(min=1.0)
-
-        p_mad = ((p_exp - p_med).abs() * M_u).sum(dim=2, keepdim=True) / safe_counts
-        t_mad = ((t_exp - t_med).abs() * M_u).sum(dim=2, keepdim=True) / safe_counts
-
-        # Skip segments where teacher depth is completely flat (e.g., pure 0.0 sky bin)
-        non_flat = (t_mad > 1e-5).float() * valid_group
-
-        p_norm = (p_exp - p_med) / p_mad.clamp(min=1e-6)
-        t_norm = (t_exp - t_med) / t_mad.clamp(min=1e-6)
-
-        diff = (p_norm - t_norm).abs() * M_u * non_flat
-        denom = (M_u * non_flat).sum() + 1e-8
-        return diff.sum() / denom
-
-    def _gradient_and_normal_loss(self, pred, target, mask):
-        total_grad = 0.0
-        total_normal = 0.0
-
-        for scale in range(self.grad_scales):
-            k = 2 ** scale
-            if k > 1:
-                p = F.avg_pool2d(pred.unsqueeze(1), k).squeeze(1)
-                t = F.avg_pool2d(target.unsqueeze(1), k).squeeze(1)
-                m = (F.avg_pool2d(mask.unsqueeze(1), k).squeeze(1) > 0.99).float()
-            else:
-                p, t, m = pred, target, mask
-
-            p_dx = p[:, :, 1:] - p[:, :, :-1]
-            p_dy = p[:, 1:, :] - p[:, :-1, :]
-            t_dx = t[:, :, 1:] - t[:, :, :-1]
-            t_dy = t[:, 1:, :] - t[:, :-1, :]
-
-            m_x = m[:, :, 1:] * m[:, :, :-1]
-            m_y = m[:, 1:, :] * m[:, :-1, :]
-
-            loss_x = ((p_dx - t_dx).abs() * m_x).sum()
-            loss_y = ((p_dy - t_dy).abs() * m_y).sum()
-            denom = m_x.sum() + m_y.sum() + 1e-8
-            total_grad += (loss_x + loss_y) / denom
-
-            # 2D Disparity Virtual Normal Cosine Loss on overlapping valid (H-1, W-1) grid
-            if self.alpha["normal"] > 0:
-                px = self.normal_beta * p_dx[:, :-1, :]
-                py = self.normal_beta * p_dy[:, :, :-1]
-                tx = self.normal_beta * t_dx[:, :-1, :]
-                ty = self.normal_beta * t_dy[:, :, :-1]
-                m_xy = m_x[:, :-1, :] * m_y[:, :, :-1]
-
-                # Surface normal n = (-beta*dx, -beta*dy, 1) / ||(-beta*dx, -beta*dy, 1)||
-                ones = torch.ones_like(px)
-                n_pred = F.normalize(torch.stack([-px, -py, ones], dim=1), dim=1, eps=1e-6)
-                n_tgt = F.normalize(torch.stack([-tx, -ty, ones], dim=1), dim=1, eps=1e-6)
-
-                cos_sim = (n_pred * n_tgt).sum(dim=1)
-                normal_err = (1.0 - cos_sim) * m_xy
-                total_normal += normal_err.sum() / (m_xy.sum() + 1e-8)
-
-        return total_grad / self.grad_scales, total_normal / self.grad_scales
+    def _gradient_and_normal_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pred, target = self._squeeze(pred, target)
+        if mask is not None:
+            (mask,) = self._squeeze(mask)
+        return grad_normal_loss(
+            pred,
+            target,
+            mask=mask,
+            grad_scales=self.grad_scales,
+            normal_beta=self.normal_beta,
+            compute_normal=(self.alpha["normal"] > 0),
+        )
 
     @staticmethod
-    def _squeeze(*tensors):
+    def _squeeze(*tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         return tuple(t.squeeze(1) if t.dim() == 4 else t for t in tensors)
 
