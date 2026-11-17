@@ -196,6 +196,7 @@ def main(args):
             "persistent_workers": (args.num_workers > 0),
             "prefetch_factor": getattr(args, 'prefetch_factor', 3) if args.num_workers > 0 else None,
             "transform": train_transforms,
+            "channels_first": False,
         }
         if hasattr(args, 'shuffle_algo') and args.shuffle_algo:
             loader_kwargs["shuffle_algo"] = args.shuffle_algo
@@ -213,6 +214,7 @@ def main(args):
             domains=args.domains.split(',') if isinstance(args.domains, str) else args.domains,
             transform=train_transforms,
             max_samples=args.max_train_samples,
+            channels_first=False,
         )
 
         if args.balanced_sampling:

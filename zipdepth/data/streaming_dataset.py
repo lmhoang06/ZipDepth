@@ -335,6 +335,7 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
         shuffle=True,
         cache_limit=None,
         keep_zip=False,
+        channels_first: bool = True,
         **kwargs
     ):
         if not STREAMING_AVAILABLE:
@@ -347,6 +348,7 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
             raise ValueError("Either 'streams' or 'local' must be provided.")
 
         self.transform = transform
+        self.channels_first = channels_first
         self._batch_size = batch_size
 
         super().__init__(
@@ -451,7 +453,10 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
             rgb, depth = self.transform(rgb, depth)
 
         # 5. Format tensors matching LargeScaleDepthDataset
-        rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+        if self.channels_first:
+            rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+        else:
+            rgb_tensor = torch.from_numpy(np.ascontiguousarray(rgb))
 
         output = {
             'image': rgb_tensor,
@@ -460,7 +465,7 @@ class MDSLargeScaleDepthDataset(StreamingDataset):
         }
 
         if depth is not None:
-            depth_tensor = torch.from_numpy(depth).unsqueeze(0).contiguous()
+            depth_tensor = torch.from_numpy(np.ascontiguousarray(depth)).unsqueeze(0)
             output['depth'] = depth_tensor
 
         return output
@@ -479,6 +484,7 @@ def create_mds_dataloader(
     persistent_workers=True,
     prefetch_factor=2,
     transform=None,
+    channels_first: bool = True,
     **kwargs
 ):
     """
@@ -523,6 +529,7 @@ def create_mds_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         cache_limit=cache_limit,
+        channels_first=channels_first,
         **kwargs
     )
 

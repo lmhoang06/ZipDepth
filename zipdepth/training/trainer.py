@@ -317,6 +317,8 @@ class ZipDepthTrainer:
                     continue
 
                 images = batch['image'].to(self.device, non_blocking=True)
+                if images.ndim == 4 and images.shape[-1] == 3:
+                    images = images.permute(0, 3, 1, 2)
                 images = images.float() / 255.0
 
                 teacher_depth = batch['depth'].to(self.device, non_blocking=True)

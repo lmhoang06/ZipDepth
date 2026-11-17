@@ -34,9 +34,11 @@ class LargeScaleDepthDataset(Dataset):
                  index_file: str,
                  domains: Optional[List[str]] = None,
                  transform=None,
-                 max_samples: Optional[int] = None):
+                 max_samples: Optional[int] = None,
+                 channels_first: bool = True):
 
         self.transform = transform
+        self.channels_first = channels_first
         self._jpeg = _TURBO_JPEG
 
         index_path = Path(index_file)
@@ -132,7 +134,10 @@ class LargeScaleDepthDataset(Dataset):
                 if self.transform:
                     rgb, depth = self.transform(rgb, depth)
 
-                rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+                if self.channels_first:
+                    rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+                else:
+                    rgb_tensor = torch.from_numpy(np.ascontiguousarray(rgb))
 
                 output = {
                     'image': rgb_tensor,
@@ -141,7 +146,7 @@ class LargeScaleDepthDataset(Dataset):
                 }
 
                 if depth is not None:
-                    depth_tensor = torch.from_numpy(depth).unsqueeze(0).contiguous()
+                    depth_tensor = torch.from_numpy(np.ascontiguousarray(depth)).unsqueeze(0)
                     output['depth'] = depth_tensor
 
                 del rgb, depth
