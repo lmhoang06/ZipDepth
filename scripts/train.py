@@ -336,7 +336,8 @@ def main(args):
     print_main(f"Samples:         {len(train_dataset):,}", rank)
     print_main(f"Batches/epoch:   {len(train_loader):,}", rank)
     print_main(f"Epochs:          {args.epochs}", rank)
-    print_main(f"Batch/GPU:       {args.batch_size}  (effective: {args.batch_size * world_size})", rank)
+    print_main(f"Batch/GPU:       {args.batch_size} x {args.grad_accum_steps} accum  (effective: {args.batch_size * args.grad_accum_steps * world_size})", rank)
+    print_main(f"Updates/epoch:   {steps_per_epoch:,}", rank)
     if max_steps > 0:
         print_main(f"Max steps:       {max_steps:,}  (≈{max_steps/steps_per_epoch:.1f} epochs)", rank)
     print_main(f"LR:              {actual_lr:.2e}", rank)
