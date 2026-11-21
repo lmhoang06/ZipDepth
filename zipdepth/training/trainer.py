@@ -62,6 +62,7 @@ class ZipDepthTrainer:
                 alpha_grad=2.0,
                 loss_type='original',
                 criterion=None,
+                grad_accum_steps=1,
                 **loss_kwargs,
                 ):
         """
@@ -98,7 +99,8 @@ class ZipDepthTrainer:
         self.use_amp = use_amp
         self.log_wandb = log_wandb and WANDB_AVAILABLE
         self.writer = writer
-        self.global_step = 0
+        self.global_step = 0  # optimizer updates (not micro-batches)
+        self.grad_accum_steps = max(1, int(grad_accum_steps))
         self.is_distributed = is_distributed
         self.rank = rank
         self.world_size = world_size
@@ -154,7 +156,7 @@ class ZipDepthTrainer:
 
         # When resuming mid-epoch, skip the batches already processed so the
         # scheduler is stepped exactly the right number of times.
-        initial_skip = self.global_step % steps_per_epoch if self.global_step > 0 else 0
+        initial_skip = (self.global_step * self.grad_accum_steps) % steps_per_epoch if self.global_step > 0 else 0
         if initial_skip > 0 and self.is_main:
             print(f"\nResume: skipping first {initial_skip}/{steps_per_epoch} batches "
                   f"of epoch {start_epoch} (global_step={self.global_step})")
@@ -162,7 +164,7 @@ class ZipDepthTrainer:
         # Total iterations for the global progress bar
         total_iterations = steps_per_epoch * (num_epochs - start_epoch) - initial_skip
         if max_steps > 0:
-            total_iterations = min(total_iterations, max_steps - self.global_step)
+            total_iterations = min(total_iterations, (max_steps - self.global_step) * self.grad_accum_steps)
 
         disable_tqdm = self.is_distributed and not self.is_main
         is_interactive = sys.stdout.isatty()
@@ -334,6 +336,23 @@ class ZipDepthTrainer:
                     )
 
                 loss_value = loss.item()
+
+                accum = self.grad_accum_steps
+                if accum > 1:
+                    loss = loss / accum
+                    if (batch_idx + 1) % accum != 0 and batch_idx + 1 != num_batches:
+                        bwd = self.scaler.scale(loss) if self.scaler is not None else loss
+                        if self.is_distributed and hasattr(self.student, 'no_sync'):
+                            with self.student.no_sync():
+                                bwd.backward()
+                        else:
+                            bwd.backward()
+                        total_loss += loss_value
+                        processed_batches += 1
+                        if not disable_tqdm:
+                            pbar.update(1)
+                        del student_depth, teacher_depth, loss, bwd
+                        continue
 
                 if self.scaler is not None:
                     # FP16: use GradScaler to prevent overflow

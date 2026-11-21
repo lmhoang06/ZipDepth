@@ -84,6 +84,7 @@ def merge_config_args(cfg: dict, args: argparse.Namespace) -> argparse.Namespace
         'epochs':              cfg.get('training', {}).get('epochs', 50),
         'batch_size':          cfg.get('training', {}).get('batch_size', 16),
         'num_workers':         cfg.get('training', {}).get('num_workers', 4),
+        'grad_accum_steps':    cfg.get('training', {}).get('grad_accum_steps', 1),
         'save_dir':            cfg.get('training', {}).get('save_dir', './checkpoints'),
         'save_every_steps':    cfg.get('training', {}).get('save_every_steps', 0),
         'max_step_checkpoints':cfg.get('training', {}).get('max_step_checkpoints', 5),
@@ -255,7 +256,8 @@ def main(args):
 
     optimizer = optim.AdamW(model_params, lr=actual_lr, weight_decay=args.weight_decay)
 
-    steps_per_epoch = len(train_loader)
+    # steps_per_epoch counts optimizer updates (micro-batches / grad_accum_steps)
+    steps_per_epoch = math.ceil(len(train_loader) / max(1, args.grad_accum_steps))
     max_steps = getattr(args, 'max_steps', 0) or 0
     if max_steps > 0:
         total_steps = max_steps
@@ -308,6 +310,7 @@ def main(args):
         profile_repeat=args.profile_repeat,
         amp_dtype=args.amp_dtype,
         loss_type=args.loss_type,
+        grad_accum_steps=args.grad_accum_steps,
         alpha_ssi=args.alpha_ssi,
         alpha_grad=args.alpha_grad,
         alpha_hdn=args.alpha_hdn,
@@ -396,8 +399,8 @@ def main(args):
 
             start_epoch = 0
             trainer.global_step = 0
-            total_steps = args.epochs * len(train_loader)
-            warmup_steps = min(1000, len(train_loader) // 2)
+            total_steps = args.epochs * steps_per_epoch
+            warmup_steps = min(1000, steps_per_epoch // 2)
             scheduler = optim.lr_scheduler.SequentialLR(
                 optimizer,
                 [optim.lr_scheduler.LinearLR(optimizer, 0.1, 1.0, warmup_steps),
@@ -414,8 +417,8 @@ def main(args):
             trainer.global_step = 0
             model_params = model.module.parameters() if is_distributed else model.parameters()
             optimizer = optim.AdamW(model_params, lr=base_lr, weight_decay=args.weight_decay)
-            total_steps = args.epochs * len(train_loader)
-            warmup_steps = max(10, min(1000, len(train_loader) // 2))
+            total_steps = args.epochs * steps_per_epoch
+            warmup_steps = max(10, min(1000, steps_per_epoch // 2))
             scheduler = optim.lr_scheduler.SequentialLR(
                 optimizer,
                 [optim.lr_scheduler.LinearLR(optimizer, 0.1, 1.0, warmup_steps),
@@ -430,7 +433,7 @@ def main(args):
             # Standard resume: restore model, optimizer, and scheduler exactly.
             model.load_state_dict(state_dict)
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-            start_epoch = trainer.global_step // len(train_loader)
+            start_epoch = trainer.global_step // steps_per_epoch
             scheduler = optim.lr_scheduler.OneCycleLR(
                 optimizer,
                 max_lr=actual_lr,
@@ -515,6 +518,8 @@ if __name__ == '__main__':
     # Training (override config)
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--batch-size', type=int, default=None)
+    parser.add_argument('--grad-accum-steps', type=int, default=None,
+                        help='Micro-batches per optimizer update (effective batch = batch_size * this)')
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--num-workers', type=int, default=None)
     parser.add_argument('--save-dir', type=str, default=None)
