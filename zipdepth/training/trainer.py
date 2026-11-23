@@ -17,6 +17,7 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+from zipdepth.data.transforms import apply_depth_cutmix
 from zipdepth.loss import ZipDepthLoss
 from zipdepth.training.visualization import depth_to_spectral
 from zipdepth.utils.model_utils import strip_state_dict_prefixes
@@ -63,6 +64,8 @@ class ZipDepthTrainer:
                 loss_type='original',
                 criterion=None,
                 grad_accum_steps=1,
+                cutmix_prob=0.5,
+                cutmix_alpha=1.0,
                 **loss_kwargs,
                 ):
         """
@@ -101,6 +104,8 @@ class ZipDepthTrainer:
         self.writer = writer
         self.global_step = 0  # optimizer updates (not micro-batches)
         self.grad_accum_steps = max(1, int(grad_accum_steps))
+        self.cutmix_prob = float(cutmix_prob)
+        self.cutmix_alpha = float(cutmix_alpha)
         self.is_distributed = is_distributed
         self.rank = rank
         self.world_size = world_size
@@ -327,6 +332,14 @@ class ZipDepthTrainer:
                 teacher_depth = teacher_depth.float().div_(256.0)
 
                 del batch
+
+                if self.cutmix_prob > 0.0:
+                    images, teacher_depth = apply_depth_cutmix(
+                        images,
+                        teacher_depth,
+                        p=self.cutmix_prob,
+                        alpha=self.cutmix_alpha,
+                    )
 
                 with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=self.use_amp):
                     student_depth = self.student(images)

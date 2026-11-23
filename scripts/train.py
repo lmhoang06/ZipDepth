@@ -72,6 +72,9 @@ def merge_config_args(cfg: dict, args: argparse.Namespace) -> argparse.Namespace
 
         'height':              cfg.get('data', {}).get('height', 512),
         'width':               cfg.get('data', {}).get('width', 512),
+        'color_jitter_p':      cfg.get('data', {}).get('color_jitter_p', 0.8),
+        'cutmix_prob':         cfg.get('data', {}).get('cutmix_prob', 0.5),
+        'cutmix_alpha':        cfg.get('data', {}).get('cutmix_alpha', 1.0),
         'data_format':         cfg.get('data', {}).get('format', 'auto'),
         'index_file':          cfg.get('data', {}).get('index_file', 'data/indexes/dataset_index.json'),
         'mds_dirs':            cfg.get('data', {}).get('mds_dirs', None),
@@ -174,7 +177,11 @@ def main(args):
     # DATASET
     # ========================================================================
     print_main("\nLoading training dataset...", rank)
-    train_transforms = get_train_transforms(height=args.height, width=args.width)
+    train_transforms = get_train_transforms(
+        height=args.height,
+        width=args.width,
+        color_jitter_p=args.color_jitter_p,
+    )
 
     use_mds = (args.data_format == 'mds') or (
         args.data_format == 'auto' and (args.mds_dirs is not None or args.streams_config is not None)
@@ -311,6 +318,8 @@ def main(args):
         amp_dtype=args.amp_dtype,
         loss_type=args.loss_type,
         grad_accum_steps=args.grad_accum_steps,
+        cutmix_prob=args.cutmix_prob,
+        cutmix_alpha=args.cutmix_alpha,
         alpha_ssi=args.alpha_ssi,
         alpha_grad=args.alpha_grad,
         alpha_hdn=args.alpha_hdn,
@@ -529,6 +538,12 @@ if __name__ == '__main__':
                         help='Stop after this many gradient updates (overrides epoch count for scheduler too)')
     parser.add_argument('--height', type=int, default=None)
     parser.add_argument('--width', type=int, default=None)
+    parser.add_argument('--color-jitter-p', type=float, default=None,
+                        help='Probability of applying ColorJitter in training transforms (default: 0.8)')
+    parser.add_argument('--cutmix-prob', type=float, default=None,
+                        help='Probability of applying batch-level CutMix in ZipDepthTrainer (default: 0.5)')
+    parser.add_argument('--cutmix-alpha', type=float, default=None,
+                        help='Beta distribution alpha for CutMix area ratio (default: 1.0)')
 
     # Loss (override config)
     parser.add_argument('--loss-type', type=str, default=None,
