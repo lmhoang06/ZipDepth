@@ -47,6 +47,9 @@ def parse_args():
     parser.add_argument("--amp-dtype", type=str, default="bfloat16",
                         choices=["bfloat16", "float16", "float32"],
                         help="Precision dtype (default: bfloat16)")
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help="Micro-batches per optimizer update (batch-sizes are micro-batch sizes; "
+                             "throughput counts all samples per update)")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup steps (default: 5)")
     parser.add_argument("--steps", type=int, default=20, help="Measured steps (default: 20)")
     parser.add_argument("--dataset-size", type=int, default=1_000_000,
@@ -87,21 +90,26 @@ def benchmark_batch_size(args, batch_size: int, device: torch.device):
     target = torch.rand(batch_size, args.height, args.width, device=device) * 10.0 + 0.1
     mask = torch.ones(batch_size, args.height, args.width, dtype=torch.bool, device=device)
 
+    accum = max(1, args.grad_accum_steps)
+
     def step():
+        # One optimizer update = `accum` micro-batches (mirrors ZipDepthTrainer)
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-            pred = model(images)
-            if isinstance(pred, (tuple, list)):
-                pred = pred[0]
-            if pred.ndim == 4 and pred.shape[1] == 1:
-                pred = pred.squeeze(1)
-            loss, _ = criterion(pred, target, mask)
+        for _ in range(accum):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                pred = model(images)
+                if isinstance(pred, (tuple, list)):
+                    pred = pred[0]
+                if pred.ndim == 4 and pred.shape[1] == 1:
+                    pred = pred.squeeze(1)
+                loss, _ = criterion(pred, target, mask)
+            loss.item()  # trainer syncs on loss every micro-batch
+            loss = loss / accum if accum > 1 else loss
+            (scaler.scale(loss) if scaler.is_enabled() else loss).backward()
         if scaler.is_enabled():
-            scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss.backward()
             optimizer.step()
 
     try:
@@ -118,7 +126,7 @@ def benchmark_batch_size(args, batch_size: int, device: torch.device):
 
         peak_vram_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
         mean_step_ms = (sum(times) / len(times)) * 1000.0
-        samples_per_sec = batch_size / (sum(times) / len(times))
+        samples_per_sec = batch_size * accum / (sum(times) / len(times))
         return {
             "batch_size": batch_size,
             "oom": False,
@@ -191,7 +199,8 @@ def main():
     print(f"ZipDepth Synthetic Training Benchmark")
     print(f"GPU: {gpu_name} ({total_vram_gb:.1f} GB VRAM)")
     print(f"Model: {args.variant} | Resolution: {args.height}x{args.width} | "
-          f"Loss: {args.loss_type} | AMP: {args.amp_dtype}")
+          f"Loss: {args.loss_type} | AMP: {args.amp_dtype} | "
+          f"Accum: {args.grad_accum_steps} (step time = 1 optimizer update)")
     print(f"Reference dataset size: {args.dataset_size:,} samples"
           + (f" | Est. Colab rate: {cu_per_hr:.1f} CU/hr" if cu_per_hr > 0 else ""))
     print("=" * 78)
